@@ -15,21 +15,23 @@ import (
 	"github.com/egoist/mygo/plugins/terminal"
 )
 
-// scrollback is about how many bytes of output a session keeps above its
+// scrollback is about how many bytes of output a block keeps above its
 // screen, for the windows that attach to it.
 const scrollback = 8 << 20
 
-// session is a pseudo-terminal of the server and its shell.
-type session struct {
+// block is a terminal block: pseudo-terminal of the server and its shell.
+type block struct {
 	id      string
 	shell   string
 	created time.Time
 	p       *pty
+	// opts are the options it started with, to start it again.
+	opts BlockOptions
 
 	mu sync.Mutex
-	// vt is the session's screen, kept by the terminal emulator of the
+	// vt is the block's screen, kept by the terminal emulator of the
 	// app's terminals without a view: a window attaching gets a snapshot
-	// of it at its size, as the session shows it now.
+	// of it at its size, as the block shows it now.
 	vt         *terminal.Terminal
 	vtIn       *io.PipeWriter
 	output     uint64
@@ -44,7 +46,7 @@ type session struct {
 	done       chan struct{}
 }
 
-// attached is a connection attached to a session, whose output a
+// attached is a connection attached to a block, whose output a
 // goroutine writes so that a slow client never holds up the others.
 type attached struct {
 	conn net.Conn
@@ -74,7 +76,7 @@ func (a *attached) writer() {
 	}
 }
 
-func newSession(id string, o CreateOptions) (*session, error) {
+func newBlock(id string, o BlockOptions) (*block, error) {
 	path, argv, name, err := shellCommand(o.Command)
 	if err != nil {
 		return nil, err
@@ -87,13 +89,13 @@ func newSession(id string, o CreateOptions) (*session, error) {
 	if dir == "" {
 		dir, _ = os.UserHomeDir()
 	}
-	env := sessionEnv(id, o.Env)
+	env := blockEnv(id, o.Env)
 	p, err := startPTY(path, argv, dir, env, cols, rows)
 	if err != nil {
 		return nil, err
 	}
-	s := &session{
-		id: id, shell: name, created: time.Now(), p: p,
+	s := &block{
+		id: id, shell: name, created: time.Now(), p: p, opts: o,
 		clients: map[*attached]struct{}{},
 		cols:    cols, rows: rows, done: make(chan struct{}),
 	}
@@ -136,9 +138,9 @@ func newSession(id string, o CreateOptions) (*session, error) {
 	return s, nil
 }
 
-// sessionEnv returns the environment of a session's shell: the server's,
+// blockEnv returns the environment of a block's shell: the server's,
 // without what other terminals set, and what terminal apps set.
-func sessionEnv(id string, extra []string) []string {
+func blockEnv(id string, extra []string) []string {
 	var env []string
 	hasLang := false
 	for _, kv := range os.Environ() {
@@ -161,7 +163,7 @@ func sessionEnv(id string, extra []string) []string {
 		"COLORTERM=truecolor",
 		"TERM_PROGRAM=GoRex",
 		"TERM_PROGRAM_VERSION=0.1.0",
-		"GOREX_SESSION="+id,
+		"REX_BLOCK="+id,
 	)
 	if !hasLang {
 		env = append(env, "LANG=en_US.UTF-8")
@@ -169,7 +171,7 @@ func sessionEnv(id string, extra []string) []string {
 	return append(env, extra...)
 }
 
-func (s *session) read() {
+func (s *block) read() {
 	buf := make([]byte, 64<<10)
 	for {
 		n, err := s.p.read(buf)
@@ -193,10 +195,10 @@ func (s *session) read() {
 	}
 }
 
-// attach attaches a connection: it gets a snapshot of the session's
-// screen and scrollback at its size, then what the session prints, and
+// attach attaches a connection: it gets a snapshot of the block's
+// screen and scrollback at its size, then what the block prints, and
 // what it sends is typed.
-func (s *session) attach(conn net.Conn, cols, rows int) {
+func (s *block) attach(conn net.Conn, cols, rows int) {
 	a := &attached{conn: conn, out: make(chan []byte, 2048)}
 	s.mu.Lock()
 	if cols > 0 && rows > 0 {
@@ -241,7 +243,7 @@ func (s *session) attach(conn net.Conn, cols, rows int) {
 	s.mu.Unlock()
 }
 
-func (s *session) input(p []byte) {
+func (s *block) input(p []byte) {
 	s.mu.Lock()
 	s.lastInput = time.Now()
 	exited := s.exited
@@ -252,7 +254,7 @@ func (s *session) input(p []byte) {
 }
 
 // resize sets the size of the terminal and reports whether it changed.
-func (s *session) resize(cols, rows int) bool {
+func (s *block) resize(cols, rows int) bool {
 	s.mu.Lock()
 	changed := cols != s.cols || rows != s.rows
 	s.cols, s.rows = cols, rows
@@ -279,12 +281,12 @@ func (s *session) resize(cols, rows int) bool {
 const resyncDelay = 150 * time.Millisecond
 
 // resyncScreen sends the windows the screen of a full-screen program as
-// the session has it. A window resizes its terminal as it draws, and the
-// session as the request reaches it, while the program's output is on its
+// the block has it. A window resizes its terminal as it draws, and the
+// block as the request reaches it, while the program's output is on its
 // way: what the program drew for one size may land in a screen of
 // another, which full-screen programs, redrawing only what changed, do
 // not mend. Shells' scrollback reflows alike in both and needs nothing.
-func (s *session) resyncScreen() {
+func (s *block) resyncScreen() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.exited || len(s.clients) == 0 {
@@ -304,8 +306,8 @@ func (s *session) resyncScreen() {
 	}
 }
 
-// kill hangs up the session and waits a little for it to end.
-func (s *session) kill() {
+// kill hangs up the block and waits a little for it to end.
+func (s *block) kill() {
 	s.mu.Lock()
 	exited := s.exited
 	s.mu.Unlock()
@@ -319,10 +321,10 @@ func (s *session) kill() {
 	}
 }
 
-// info describes the session and what runs in its foreground.
-func (s *session) info() SessionInfo {
+// info describes the block and what runs in its foreground.
+func (s *block) info() BlockInfo {
 	s.mu.Lock()
-	in := SessionInfo{
+	in := BlockInfo{
 		ID: s.id, Shell: s.shell, Created: s.created,
 		Title: s.vt.Title(), LastOutput: s.lastOutput, LastInput: s.lastInput,
 		Output: s.output, Bells: int(s.bells.Load()), Exited: s.exited, ExitCode: s.code,
@@ -349,8 +351,8 @@ func (s *session) info() SessionInfo {
 	return in
 }
 
-// discard is the Conn of a session's emulator: it reads from a pipe that
-// closes with the session, and drops what it writes.
+// discard is the Conn of a block's emulator: it reads from a pipe that
+// closes with the block, and drops what it writes.
 type discard struct{ r *io.PipeReader }
 
 func (d discard) Read(p []byte) (int, error)  { return d.r.Read(p) }

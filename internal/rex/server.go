@@ -4,9 +4,6 @@ package rex
 
 import (
 	"bufio"
-	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,17 +12,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 )
 
-// Server owns the sessions.
+// Server owns the sessions, and the blocks of their windows.
 type Server struct {
-	mu       sync.Mutex
-	sessions map[string]*session
-	order    []string
-	layout   json.RawMessage
+	mu        sync.Mutex
+	rsessions []*rsession
+	// blocks are the blocks by ID, and blockOrder their IDs as they were
+	// made.
+	blocks     map[string]*block
+	blockOrder []string
+	ctrls      map[*ctrl]struct{}
+	// quitting keeps the blocks in their windows as the server ends them,
+	// to start them again next time.
+	quitting bool
+	saveMu   sync.Mutex
 	started  time.Time
 	host     HostInfo
 	hostDone chan struct{}
@@ -38,7 +41,7 @@ type Server struct {
 	quitOnce sync.Once
 }
 
-// idleTimeout is how long a server with no sessions and no app waits
+// idleTimeout is how long a server with no blocks and no app waits
 // before it exits.
 const idleTimeout = 10 * time.Minute
 
@@ -65,12 +68,12 @@ func Serve() error {
 	}
 	os.Chmod(sock, 0o600)
 	s := &Server{
-		sessions: map[string]*session{}, started: time.Now(), ln: ln,
+		blocks: map[string]*block{}, ctrls: map[*ctrl]struct{}{}, started: time.Now(), ln: ln,
 		hostDone: make(chan struct{}), idleFrom: time.Now(), quit: make(chan struct{}),
 	}
-	if b, err := os.ReadFile(filepath.Join(dir, "layout.json")); err == nil && json.Valid(b) {
-		s.layout = b
-	}
+	// The app's layout of before the server kept sessions.
+	os.Remove(filepath.Join(dir, "layout.json"))
+	s.load()
 	s.exe, s.exeTime = Executable()
 	go func() {
 		s.host = hostInfo()
@@ -87,14 +90,16 @@ func Serve() error {
 		if err != nil {
 			select {
 			case <-s.quit:
+				s.save()
 				s.mu.Lock()
-				all := make([]*session, 0, len(s.sessions))
-				for _, ss := range s.sessions {
-					all = append(all, ss)
+				s.quitting = true
+				all := make([]*block, 0, len(s.blocks))
+				for _, b := range s.blocks {
+					all = append(all, b)
 				}
 				s.mu.Unlock()
-				for _, ss := range all {
-					ss.kill()
+				for _, b := range all {
+					b.kill()
 				}
 				os.Remove(sock)
 				return nil
@@ -119,7 +124,7 @@ func (s *Server) watchIdle() {
 		case <-t.C:
 		}
 		s.mu.Lock()
-		idle := len(s.sessions) == 0 && s.controls == 0 && time.Since(s.idleFrom) > idleTimeout
+		idle := len(s.blocks) == 0 && s.controls == 0 && time.Since(s.idleFrom) > idleTimeout
 		s.mu.Unlock()
 		if idle {
 			log.Print("rex: idle, exiting")
@@ -141,54 +146,61 @@ func (s *Server) handle(conn net.Conn) {
 	var a Attach
 	if json.Unmarshal(first, &a) == nil && a.Op == "attach" {
 		s.mu.Lock()
-		ss := s.sessions[a.SID]
+		b := s.blocks[a.SID]
 		s.mu.Unlock()
-		if ss == nil {
-			conn.Write([]byte(`{"error":"no such session"}` + "\n"))
+		if b == nil {
+			conn.Write([]byte(`{"error":"no such block"}` + "\n"))
 			conn.Close()
 			return
 		}
 		conn.Write([]byte(`{"ok":true}` + "\n"))
 		// What the reader buffered past the first line is input.
 		if n := r.Buffered(); n > 0 {
-			b, _ := r.Peek(n)
-			ss.input(b)
+			p, _ := r.Peek(n)
+			b.input(p)
 		}
-		ss.attach(conn, a.Cols, a.Rows)
+		b.attach(conn, a.Cols, a.Rows)
 		return
 	}
 	s.control(conn, r, first)
 }
 
-// control serves a control connection: a request per line.
+// control serves a control connection: a request per line, answered in
+// order with the events of the sessions it attached to.
 func (s *Server) control(conn net.Conn, r *bufio.Reader, first []byte) {
+	c := &ctrl{conn: conn, out: make(chan []byte, 4096), sessions: map[string]bool{}}
 	s.mu.Lock()
 	s.controls++
+	s.ctrls[c] = struct{}{}
 	s.mu.Unlock()
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		for line := range c.out {
+			if _, err := conn.Write(line); err != nil {
+				conn.Close()
+				for range c.out {
+				}
+				return
+			}
+		}
+	}()
 	defer func() {
 		s.mu.Lock()
 		s.controls--
+		delete(s.ctrls, c)
 		s.idleFrom = time.Now()
 		s.mu.Unlock()
+		close(c.out)
+		<-written
 		conn.Close()
 	}()
-	var wmu sync.Mutex
-	reply := func(res Response) {
-		b, _ := json.Marshal(res)
-		wmu.Lock()
-		conn.Write(append(b, '\n'))
-		wmu.Unlock()
-	}
 	line := first
 	for {
 		var req Request
 		if err := json.Unmarshal(line, &req); err == nil {
-			// Kills wait for the session to end: answer them aside.
-			if req.Op == "kill" {
-				go func() { reply(s.request(req)) }()
-			} else {
-				reply(s.request(req))
-			}
+			b, _ := json.Marshal(s.request(c, req))
+			c.out <- append(b, '\n')
 		}
 		var err error
 		line, err = r.ReadBytes('\n')
@@ -198,26 +210,43 @@ func (s *Server) control(conn net.Conn, r *bufio.Reader, first []byte) {
 	}
 }
 
-func (s *Server) request(req Request) Response {
-	data, err := s.do(req)
+// readOnly are the methods that change nothing to save.
+var readOnly = map[string]bool{"session.list": true, "session.view": true, "session.attach": true}
+
+func (s *Server) request(c *ctrl, req Request) Response {
+	var data any
+	var err error
+	if req.Method != "" {
+		data, err = s.call(c, req.Method, req.Params)
+		if err == nil && !readOnly[req.Method] {
+			s.save()
+		}
+	} else {
+		data, err = s.do(req)
+	}
 	res := Response{ID: req.ID}
 	if err != nil {
 		res.Error = err.Error()
+		var ae *APIError
+		if errors.As(err, &ae) {
+			res.Code = ae.Code
+		}
 	} else if data != nil {
 		res.Data, _ = json.Marshal(data)
 	}
 	return res
 }
 
-func (s *Server) session(id string) (*session, error) {
+func (s *Server) block(id string) (*block, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ss := s.sessions[id]; ss != nil {
-		return ss, nil
+	if b := s.blocks[id]; b != nil {
+		return b, nil
 	}
-	return nil, fmt.Errorf("no session %q", id)
+	return nil, fmt.Errorf("no block %q", id)
 }
 
+// do runs one of GoRex's own operations.
 func (s *Server) do(req Request) (any, error) {
 	switch req.Op {
 	case "hello":
@@ -228,73 +257,22 @@ func (s *Server) do(req Request) (any, error) {
 		return Hello{Version: ProtocolVersion, PID: os.Getpid(), Started: s.started, Host: s.host, Exe: s.exe, ExeTime: s.exeTime}, nil
 	case "list":
 		s.mu.Lock()
-		all := make([]*session, 0, len(s.order))
-		for _, id := range s.order {
-			all = append(all, s.sessions[id])
+		all := make([]*block, 0, len(s.blockOrder))
+		for _, id := range s.blockOrder {
+			all = append(all, s.blocks[id])
 		}
 		s.mu.Unlock()
-		infos := make([]SessionInfo, len(all))
-		for i, ss := range all {
-			infos[i] = ss.info()
+		infos := make([]BlockInfo, len(all))
+		for i, b := range all {
+			infos[i] = b.info()
 		}
 		return infos, nil
-	case "create":
-		o := CreateOptions{}
-		if req.Create != nil {
-			o = *req.Create
-		}
-		id := newID()
-		ss, err := newSession(id, o)
-		if err != nil {
-			return nil, err
-		}
-		s.mu.Lock()
-		s.sessions[id] = ss
-		s.order = append(s.order, id)
-		s.mu.Unlock()
-		return ss.info(), nil
-	case "kill":
-		ss, err := s.session(req.SID)
-		if err != nil {
-			return nil, nil // already gone
-		}
-		ss.kill()
-		s.mu.Lock()
-		delete(s.sessions, req.SID)
-		s.order = slices.DeleteFunc(s.order, func(id string) bool { return id == req.SID })
-		if len(s.sessions) == 0 {
-			s.idleFrom = time.Now()
-		}
-		s.mu.Unlock()
-		return nil, nil
 	case "resize":
-		ss, err := s.session(req.SID)
+		b, err := s.block(req.SID)
 		if err != nil {
 			return nil, err
 		}
-		ss.resize(req.Cols, req.Rows)
-		return nil, nil
-	case "getLayout":
-		s.mu.Lock()
-		l := s.layout
-		s.mu.Unlock()
-		if l == nil {
-			return nil, nil
-		}
-		return l, nil
-	case "setLayout":
-		if !json.Valid(req.Layout) {
-			return nil, errors.New("layout is not JSON")
-		}
-		l := bytes.Clone(req.Layout)
-		s.mu.Lock()
-		s.layout = l
-		s.mu.Unlock()
-		path := filepath.Join(Dir(), "layout.json")
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, l, 0o600); err == nil {
-			os.Rename(tmp, path)
-		}
+		b.resize(req.Cols, req.Rows)
 		return nil, nil
 	case "shutdown":
 		go func() {
@@ -304,12 +282,6 @@ func (s *Server) do(req Request) (any, error) {
 		return nil, nil
 	}
 	return nil, fmt.Errorf("unknown op %q", req.Op)
-}
-
-func newID() string {
-	var b [6]byte
-	rand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }
 
 // Spawn starts a server in the background, as a process of its own that

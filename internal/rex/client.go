@@ -23,6 +23,7 @@ type Client struct {
 	pending map[int64]chan Response
 	err     error
 	closed  chan struct{}
+	onEvent func(Event)
 }
 
 // Connect connects to the server, starting one in the background when
@@ -110,6 +111,14 @@ func (c *Client) read() {
 			continue
 		}
 		c.mu.Lock()
+		if res.Event != nil && res.ID == 0 {
+			fn := c.onEvent
+			c.mu.Unlock()
+			if fn != nil {
+				fn(*res.Event)
+			}
+			continue
+		}
 		ch := c.pending[res.ID]
 		delete(c.pending, res.ID)
 		c.mu.Unlock()
@@ -145,7 +154,10 @@ func (c *Client) call(req Request, out any) error {
 		c.mu.Lock()
 		delete(c.pending, req.ID)
 		c.mu.Unlock()
-		return fmt.Errorf("rex: %s timed out", req.Op)
+		return fmt.Errorf("rex: %s%s timed out", req.Op, req.Method)
+	}
+	if res.Code != "" {
+		return &APIError{Code: res.Code, Msg: res.Error}
 	}
 	if res.Error != "" {
 		return errors.New(res.Error)
@@ -161,30 +173,31 @@ func (c *Client) Hello() (h Hello, err error) {
 	return
 }
 
-func (c *Client) List() (s []SessionInfo, err error) {
+func (c *Client) List() (s []BlockInfo, err error) {
 	err = c.call(Request{Op: "list"}, &s)
 	return
 }
-
-func (c *Client) Create(o CreateOptions) (s SessionInfo, err error) {
-	err = c.call(Request{Op: "create", Create: &o}, &s)
-	return
-}
-
-func (c *Client) Kill(sid string) error { return c.call(Request{Op: "kill", SID: sid}, nil) }
 
 func (c *Client) Resize(sid string, cols, rows int) error {
 	return c.call(Request{Op: "resize", SID: sid, Cols: cols, Rows: rows}, nil)
 }
 
-func (c *Client) Layout() (json.RawMessage, error) {
-	var l json.RawMessage
-	err := c.call(Request{Op: "getLayout"}, &l)
-	return l, err
+// Call calls one of Rex's methods with its arguments, decoding its result
+// into out. A failure with Rex's code for it is an *APIError.
+func (c *Client) Call(method string, params any, out any) error {
+	p, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	return c.call(Request{Method: method, Params: p}, out)
 }
 
-func (c *Client) SetLayout(l json.RawMessage) error {
-	return c.call(Request{Op: "setLayout", Layout: l}, nil)
+// OnEvent sets the function that gets the events of the sessions the
+// connection attached to, on the connection's goroutine.
+func (c *Client) OnEvent(fn func(Event)) {
+	c.mu.Lock()
+	c.onEvent = fn
+	c.mu.Unlock()
 }
 
 func (c *Client) Shutdown() error { return c.call(Request{Op: "shutdown"}, nil) }

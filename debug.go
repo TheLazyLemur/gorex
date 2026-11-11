@@ -77,7 +77,7 @@ func (a *App) debug(dir, line string) {
 			win.Update(func() {
 				if t := a.tab(); t != nil {
 					if ps := t.panes(); atoi(arg)-1 < len(ps) {
-						t.setFocus(ps[atoi(arg)-1])
+						a.focus(ps[atoi(arg)-1])
 						a.focusReq = t.Focus
 					}
 				}
@@ -85,7 +85,7 @@ func (a *App) debug(dir, line string) {
 		case "name":
 			win.Update(func() {
 				if t := a.tab(); t != nil {
-					t.Name = arg
+					a.setTabName(t, arg)
 				}
 			})
 		case "close":

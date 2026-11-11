@@ -19,18 +19,18 @@ import (
 	"gorex/internal/rex"
 )
 
-// Tab is a tab of the window: panes in a tree of splits.
+// Tab is a tab of the window: a window of the server's session, its
+// panes in a tree of splits. The server owns them: the app shows its view
+// and asks it for every change.
 type Tab struct {
 	ID   int
+	WID  string // the server's window
 	Name string // the name the user gave it, "" to follow its panes
 	Root *Node
 	// Focus is the pane with the focus, and Zoom the pane that fills the
 	// tab, when one does.
 	Focus *Pane
 	Zoom  *Pane
-	// recent lists the panes by when they had the focus last, the latest
-	// last: closing a pane gives the focus back to the one before.
-	recent []*Pane
 }
 
 // Node is a pane, or a split of two nodes.
@@ -45,30 +45,27 @@ type Node struct {
 	A, B     *Node
 }
 
-// Pane is a terminal attached to a session of the server.
+// Pane is a terminal attached to a block of the server.
 type Pane struct {
 	ID     int
-	SID    string
+	Block  string
 	Tab    *Tab
 	Node   *Node
 	term   *terminal.Terminal
 	stream *rex.Stream
 
-	// info is what the server last said of the session.
-	info rex.SessionInfo
+	// info is what the server last said of the block.
+	info rex.BlockInfo
 	// title is the last title the program set.
 	title string
-	// lastData is when the session last printed, in Unix nanoseconds.
+	// lastData is when the block last printed, in Unix nanoseconds.
 	lastData atomic.Int64
 	// attention marks a pane that rang the bell or whose program finished
 	// while it was out of sight; seen clears it.
 	attention bool
 	// bounds is where the pane's card was in the last frame.
-	bounds ui.Rect
-	closed bool
-	// restored tells that the session was made anew for a pane of a
-	// saved layout whose session was gone.
-	restored bool
+	bounds   ui.Rect
+	closed   bool
 	startDir string
 }
 
@@ -79,9 +76,19 @@ type App struct {
 	hello  rex.Hello
 	err    string
 
-	tabs   []*Tab
-	active int
+	// session is the server's session the window shows, and revision the
+	// revision of its view the tabs show.
+	session  string
+	revision int
+	tabs     []*Tab
+	active   int
+	// panes are the panes by their blocks, and keys the keys of the
+	// server's IDs, which name tabs, splits and panes in the view.
+	panes  map[string]*Pane
+	keys   map[string]int
 	nextID int
+	// infos are what the server last said of the blocks.
+	infos map[string]rex.BlockInfo
 
 	// focusReq asks the view to give the keyboard focus to a pane's
 	// terminal.
@@ -95,11 +102,8 @@ type App struct {
 	renaming     *Tab
 	renameText   string
 	renameFocus  bool
-	saveDue      bool
-	lastSave     time.Time
 	quitting     bool
 	focusedWin   bool
-	lastSnapshot string
 	title        string
 
 	// posted are changes to make in the next frame, from terminals of a
@@ -114,6 +118,16 @@ func (a *App) post(fn func()) {
 	a.postMu.Lock()
 	a.posted = append(a.posted, fn)
 	a.postMu.Unlock()
+}
+
+// update runs fn on the main thread, in the window, or in the next frame
+// of a view without one.
+func (a *App) update(fn func()) {
+	if win := a.win; win != nil {
+		win.Update(fn)
+	} else {
+		a.post(fn)
+	}
 }
 
 // later changes the tree of tabs and panes once the frame building now
@@ -139,6 +153,19 @@ func (a *App) id() int {
 	return a.nextID
 }
 
+// key returns the key of a server's ID, the same as long as the app runs.
+func (a *App) key(id string) int {
+	if a.keys == nil {
+		a.keys = map[string]int{}
+	}
+	k, ok := a.keys[id]
+	if !ok {
+		k = a.id()
+		a.keys[id] = k
+	}
+	return k
+}
+
 func (a *App) tab() *Tab {
 	if a.active >= 0 && a.active < len(a.tabs) {
 		return a.tabs[a.active]
@@ -160,58 +187,178 @@ func (n *Node) panes() []*Pane {
 
 func (t *Tab) panes() []*Pane { return t.Root.panes() }
 
-// setFocus gives a pane the focus of its tab.
+// setFocus shows a pane as its tab's focused one; focus asks the server.
 func (t *Tab) setFocus(p *Pane) {
 	if p == nil {
 		return
 	}
 	t.Focus = p
 	p.attention = false
-	t.recent = slices.DeleteFunc(t.recent, func(q *Pane) bool { return q == p })
-	t.recent = append(t.recent, p)
 }
 
-// newPane makes a pane with a new session in dir.
-func (a *App) newPane(dir string, cols, rows int) *Pane {
-	if cols <= 0 {
-		cols, rows = 80, 24
-	}
-	info, err := a.client.Create(rex.CreateOptions{Dir: dir, Cols: cols, Rows: rows})
+// call calls one of the server's methods on the window's session.
+func (a *App) call(method string, params map[string]any, out any) error {
+	params["session_id"] = a.session
+	err := a.client.Call(method, params, out)
 	if err != nil {
-		log.Printf("creating a session: %v", err)
+		log.Printf("%s: %v", method, err)
 		a.err = err.Error()
-		info = rex.SessionInfo{ID: "", Exited: true}
 	}
-	p := &Pane{ID: a.id(), SID: info.ID, info: info, startDir: dir}
-	if p.info.Dir == "" {
-		p.info.Dir = dir
-	}
-	a.attach(p, cols, rows)
-	return p
+	return err
 }
 
-// attach makes the pane's terminal, attached to its session.
-func (a *App) attach(p *Pane, cols, rows int) {
-	if p.SID == "" {
-		term, err := terminal.New(terminal.Options{Conn: nopConn{}, Transparent: true, Font: termFont, Theme: lightTerm, DarkTheme: darkTerm})
-		if err == nil {
-			term.Feed([]byte("\x1b[31mCould not start a session: " + a.err + "\x1b[0m\r\n"))
-			p.term = term
-		}
+// start shows the server's first session, or a new one, with a tab in
+// home when it has none.
+func (a *App) start() {
+	var list struct {
+		Sessions []struct {
+			ID string `json:"session_id"`
+		} `json:"sessions"`
+	}
+	if err := a.client.Call("session.list", map[string]any{}, &list); err != nil {
+		a.err = err.Error()
 		return
 	}
-	p.stream = a.client.Stream(p.SID, cols, rows)
-	p.stream.OnData = func(int) { p.lastData.Store(time.Now().UnixNano()) }
-	// The terminal's callbacks change the state on the main thread, in
-	// the window that made the pane, as long as it is open.
-	win := a.win
-	update := func(fn func()) {
-		if win != nil {
-			win.Update(fn)
-		} else {
-			a.post(fn)
+	if len(list.Sessions) > 0 {
+		a.session = list.Sessions[0].ID
+	} else {
+		var s struct {
+			ID string `json:"session_id"`
+		}
+		if err := a.client.Call("session.create", map[string]any{}, &s); err != nil {
+			a.err = err.Error()
+			return
+		}
+		a.session = s.ID
+	}
+	a.client.OnEvent(a.onEvent)
+	if a.call("session.attach", map[string]any{}, nil) != nil {
+		return
+	}
+	a.refreshInfos()
+	a.sync()
+	if len(a.tabs) == 0 {
+		home, _ := os.UserHomeDir()
+		a.newTab(home)
+	}
+}
+
+// onEvent takes an event of the session, on the client's goroutine: a
+// view newer than the tabs show is fetched on the main thread.
+func (a *App) onEvent(e rex.Event) {
+	var se rex.SessionEvent
+	if e.Type != "session_event" || json.Unmarshal(e.Payload, &se) != nil || se.Event.Type != "session_view_changed" {
+		return
+	}
+	var p struct {
+		Revision int `json:"revision"`
+	}
+	if json.Unmarshal(se.Event.Payload, &p) != nil {
+		return
+	}
+	a.update(func() {
+		if se.SessionID == a.session && p.Revision > a.revision {
+			a.sync()
+		}
+	})
+}
+
+// sync fetches the session's view and shows it.
+func (a *App) sync() {
+	var v rex.SessionView
+	if a.call("session.view", map[string]any{}, &v) == nil {
+		a.show(v)
+	}
+}
+
+// show makes the tabs those of a view of the session: tabs and panes it
+// still has stay, their terminals attached; those it lost close.
+func (a *App) show(v rex.SessionView) {
+	if a.panes == nil {
+		a.panes = map[string]*Pane{}
+	}
+	var focusBefore *Pane
+	if t := a.tab(); t != nil {
+		focusBefore = t.Focus
+	}
+	byWID := map[string]*Tab{}
+	for _, t := range a.tabs {
+		byWID[t.WID] = t
+	}
+	live := map[string]bool{}
+	var tabs []*Tab
+	active := 0
+	for i, w := range v.Windows {
+		t := byWID[w.ID]
+		if t == nil {
+			t = &Tab{ID: a.key(w.ID), WID: w.ID}
+		}
+		t.Name = w.Label
+		if t.Name == rex.DefaultWindowLabel(w.ID) {
+			t.Name = ""
+		}
+		t.Root = a.layoutNode(w.Layout, t, nil, live)
+		focus := a.panes[w.Focus]
+		if focus != t.Focus {
+			t.setFocus(focus)
+		}
+		t.Zoom = a.panes[w.Zoom]
+		tabs = append(tabs, t)
+		if w.ID == v.Active {
+			active = i
 		}
 	}
+	for id, p := range a.panes {
+		if !live[id] {
+			p.closed = true
+			if p.term != nil {
+				p.term.Close()
+			}
+			delete(a.panes, id)
+		}
+	}
+	a.tabs, a.active, a.revision = tabs, active, v.Revision
+	if a.renaming != nil && !slices.Contains(tabs, a.renaming) {
+		a.renaming = nil
+	}
+	if t := a.tab(); t != nil && t.Focus != focusBefore {
+		a.focusReq = t.Focus
+	}
+	if len(tabs) == 0 && a.win != nil {
+		a.win.Close()
+	}
+}
+
+// layoutNode makes the node of a layout, its panes those of the blocks the app
+// has, or new ones attached to theirs.
+func (a *App) layoutNode(l *rex.LayoutNode, t *Tab, parent *Node, live map[string]bool) *Node {
+	if l.Block != nil {
+		id := l.Block.ID
+		p := a.panes[id]
+		if p == nil {
+			in := a.infos[id]
+			p = &Pane{ID: a.key(id), Block: id, info: in, startDir: in.Dir}
+			if in.Cols == 0 {
+				in.Cols, in.Rows = 80, 24
+			}
+			a.attach(p, in.Cols, in.Rows)
+			a.panes[id] = p
+		}
+		live[id] = true
+		n := &Node{ID: p.ID, Pane: p, Parent: parent}
+		p.Tab, p.Node = t, n
+		return n
+	}
+	sp := l.Split
+	n := &Node{ID: a.key(sp.ID), Parent: parent, Vertical: sp.Direction == "vertical", Ratio: float32(sp.Ratio)}
+	n.A, n.B = a.layoutNode(sp.Before, t, n, live), a.layoutNode(sp.After, t, n, live)
+	return n
+}
+
+// attach makes the pane's terminal, attached to its block.
+func (a *App) attach(p *Pane, cols, rows int) {
+	p.stream = a.client.Stream(p.Block, cols, rows)
+	p.stream.OnData = func(int) { p.lastData.Store(time.Now().UnixNano()) }
 	term, err := terminal.New(terminal.Options{
 		Conn:        p.stream,
 		Font:        termFont,
@@ -219,10 +366,10 @@ func (a *App) attach(p *Pane, cols, rows int) {
 		DarkTheme:   darkTerm,
 		Transparent: true,
 		OnTitle: func(title string) {
-			update(func() { p.title = title })
+			a.update(func() { p.title = title })
 		},
 		OnBell: func() {
-			update(func() { a.ring(p) })
+			a.update(func() { a.ring(p) })
 		},
 		OnNotify: func(title, body string) {
 			if title == "" {
@@ -230,31 +377,19 @@ func (a *App) attach(p *Pane, cols, rows int) {
 			}
 			mygo.NewNotification(mygo.NotificationOptions{Title: title, Body: body}).Show()
 		},
-		OnExit: func(int) {
-			update(func() {
-				if !p.closed && !a.quitting {
-					a.closePane(p)
-				}
-			})
-		},
+		// A program that exits closes its block on the server, whose view
+		// takes the pane away.
 	})
 	if err != nil {
 		log.Printf("terminal: %v", err)
 		a.err = err.Error()
 		return
 	}
-	// Until a view shows it, the terminal has the session's size, so that
-	// attaching changes nothing in the session.
+	// Until a view shows it, the terminal has the block's size, so that
+	// attaching changes nothing in the block.
 	term.Resize(cols, rows)
 	p.term = term
 }
-
-// nopConn is the Conn of a terminal that only shows what the app feeds it.
-type nopConn struct{}
-
-func (nopConn) Read([]byte) (int, error)    { select {} }
-func (nopConn) Write(p []byte) (int, error) { return len(p), nil }
-func (nopConn) Close() error                { return nil }
 
 func (a *App) ring(p *Pane) {
 	if t := a.tab(); t == nil || t.Focus != p || p.Tab != t || !a.focusedWin {
@@ -262,19 +397,29 @@ func (a *App) ring(p *Pane) {
 	}
 }
 
+// shell is the layout of a block of the user's shell in dir.
+func shell(dir string, cols, rows int) *rex.LayoutNode {
+	return &rex.LayoutNode{Block: &rex.LayoutBlock{Flavor: rex.ShellFlavor, Options: &rex.BlockOptions{Dir: dir, Cols: cols, Rows: rows}}}
+}
+
 // newTab opens a tab with a shell in dir, after the active tab.
 func (a *App) newTab(dir string) *Tab {
-	t := &Tab{ID: a.id()}
-	p := a.newPane(dir, 0, 0)
-	t.Root = &Node{ID: a.id(), Pane: p}
-	p.Tab, p.Node = t, t.Root
-	t.setFocus(p)
-	at := min(a.active+1, len(a.tabs))
-	a.tabs = slices.Insert(a.tabs, at, t)
-	a.active = at
-	a.focusReq = p
-	a.changed()
-	return t
+	var w struct {
+		WindowID string `json:"window_id"`
+	}
+	if a.call("session.new_window", map[string]any{"layout": shell(dir, 0, 0)}, &w) != nil {
+		return nil
+	}
+	if at := a.active + 1; at < len(a.tabs) {
+		a.call("session.move_window", map[string]any{"window_id": w.WindowID, "before_window_id": a.tabs[at].WID}, nil)
+	}
+	a.sync()
+	for _, t := range a.tabs {
+		if t.WID == w.WindowID {
+			return t
+		}
+	}
+	return nil
 }
 
 // currentDir returns the directory new panes open in: the focused pane's.
@@ -294,131 +439,83 @@ func (a *App) split(vertical bool) {
 	if t == nil || t.Focus == nil {
 		return
 	}
-	old := t.Focus
-	t.Zoom = nil
-	n := old.Node
 	cols, rows := 80, 24
-	if old.term != nil {
-		cols, rows = old.term.Size()
+	if term := t.Focus.term; term != nil {
+		cols, rows = term.Size()
 		if vertical {
 			rows = max(rows/2, 2)
 		} else {
 			cols = max(cols/2, 10)
 		}
 	}
-	p := a.newPane(a.currentDir(), cols, rows)
-	p.Tab = t
-	left := &Node{ID: a.id(), Pane: old, Parent: n}
-	right := &Node{ID: a.id(), Pane: p, Parent: n}
-	old.Node, p.Node = left, right
-	n.Pane, n.A, n.B, n.Vertical, n.Ratio = nil, left, right, vertical, 0.5
-	t.setFocus(p)
-	a.focusReq = p
-	a.changed()
+	a.call("session.new_split", map[string]any{
+		"anchor_id": t.Focus.Block, "direction": direction(vertical), "side": "after",
+		"layout": shell(a.currentDir(), cols, rows), "focus": true,
+	}, nil)
+	a.sync()
 }
 
-// closePane closes a pane and ends its session.
+func direction(vertical bool) string {
+	if vertical {
+		return "vertical"
+	}
+	return "horizontal"
+}
+
+// closePane closes a pane and ends its block.
 func (a *App) closePane(p *Pane) {
 	if p.closed {
 		return
 	}
-	p.closed = true
-	if p.term != nil {
-		p.term.Close()
-	}
-	if sid := p.SID; sid != "" {
-		c := a.client
-		go c.Kill(sid)
-	}
-	t := p.Tab
-	if t.Zoom == p {
-		t.Zoom = nil
-	}
-	t.recent = slices.DeleteFunc(t.recent, func(q *Pane) bool { return q == p })
-	n := p.Node
-	if n.Parent == nil {
-		a.removeTab(t)
-		return
-	}
-	parent := n.Parent
-	other := parent.A
-	if other == n {
-		other = parent.B
-	}
-	// The other side takes the parent's place.
-	parent.Pane, parent.A, parent.B, parent.Vertical, parent.Ratio = other.Pane, other.A, other.B, other.Vertical, other.Ratio
-	if parent.Pane != nil {
-		parent.Pane.Node = parent
-	} else {
-		parent.A.Parent, parent.B.Parent = parent, parent
-	}
-	if t.Focus == p {
-		next := (*Pane)(nil)
-		if k := len(t.recent); k > 0 {
-			next = t.recent[k-1]
-		} else if ps := t.panes(); len(ps) > 0 {
-			next = ps[0]
-		}
-		t.Focus = nil
-		t.setFocus(next)
-	}
-	if a.tab() == t {
-		a.focusReq = t.Focus
-	}
-	a.changed()
+	a.call("block.close", map[string]any{"block_id": p.Block}, nil)
+	a.sync()
 }
 
-func (a *App) removeTab(t *Tab) {
-	i := slices.Index(a.tabs, t)
-	if i < 0 {
-		return
-	}
-	a.tabs = slices.Delete(a.tabs, i, i+1)
-	if a.active > i || a.active >= len(a.tabs) {
-		a.active = max(a.active-1, 0)
-	}
-	if a.renaming == t {
-		a.renaming = nil
-	}
-	if len(a.tabs) == 0 {
-		a.changed()
-		a.save()
-		if a.win != nil {
-			a.win.Close()
-		}
-		return
-	}
-	if nt := a.tab(); nt != nil {
-		a.focusReq = nt.Focus
-	}
-	a.changed()
-}
-
-// closeTab closes a tab and ends the sessions of its panes.
+// closeTab closes a tab and ends the blocks of its panes.
 func (a *App) closeTab(t *Tab) {
-	for _, p := range t.panes() {
-		p.closed = true
-		if p.term != nil {
-			p.term.Close()
-		}
-		if p.SID != "" {
-			go a.client.Kill(p.SID)
-		}
-	}
-	a.removeTab(t)
+	a.call("session.close_window", map[string]any{"window_id": t.WID}, nil)
+	a.sync()
 }
 
 func (a *App) selectTab(i int) {
 	if i < 0 || i >= len(a.tabs) {
 		return
 	}
-	a.active = i
-	t := a.tabs[i]
-	if t.Focus != nil {
+	a.call("session.focus_window", map[string]any{"window_id": a.tabs[i].WID}, nil)
+	a.sync()
+	if t := a.tab(); t != nil && t.Focus != nil {
 		t.Focus.attention = false
+		a.focusReq = t.Focus
 	}
-	a.focusReq = t.Focus
-	a.changed()
+}
+
+// moveTab moves a tab to the place of the nth.
+func (a *App) moveTab(t *Tab, to int) {
+	order := slices.DeleteFunc(slices.Clone(a.tabs), func(o *Tab) bool { return o == t })
+	before := ""
+	if to < len(order) {
+		before = order[to].WID
+	}
+	if slices.Index(a.tabs, t) == to {
+		return
+	}
+	a.call("session.move_window", map[string]any{"window_id": t.WID, "before_window_id": before}, nil)
+	a.sync()
+}
+
+// setTabName names a tab; an empty name follows its panes again.
+func (a *App) setTabName(t *Tab, name string) {
+	a.call("session.set_window_label", map[string]any{"window_id": t.WID, "label": name}, nil)
+	a.sync()
+}
+
+// focus gives a pane the focus of its tab.
+func (a *App) focus(p *Pane) {
+	if p == nil || p.Tab == nil {
+		return
+	}
+	p.Tab.setFocus(p)
+	a.call("session.focus_block", map[string]any{"block_id": p.Block}, nil)
 }
 
 // moveFocus gives the focus to the pane next to the focused one, toward
@@ -468,7 +565,7 @@ func (a *App) moveFocus(dx, dy int) {
 		}
 	}
 	if best != nil {
-		t.setFocus(best)
+		a.focus(best)
 		a.focusReq = best
 	}
 }
@@ -478,6 +575,16 @@ func abs(v float32) float32 {
 		return -v
 	}
 	return v
+}
+
+// setRatio moves the divider of a split, giving its first side ratio of
+// the room.
+func (a *App) setRatio(n *Node, ratio float32) {
+	n.Ratio = ratio
+	a.call("session.resize_pane", map[string]any{
+		"direction": direction(n.Vertical), "ratio": float64(ratio),
+		"before_block_id": n.A.panes()[0].Block, "after_block_id": n.B.panes()[0].Block,
+	}, nil)
 }
 
 // resizeFocused moves the nearest divider of the focused pane on the
@@ -497,8 +604,8 @@ func (a *App) resizeFocused(dx, dy int) {
 		if dx < 0 || dy < 0 {
 			step = -step
 		}
-		p.Ratio = min(max(p.Ratio+step, 0.1), 0.9)
-		a.changed()
+		a.setRatio(p, min(max(p.Ratio+step, 0.1), 0.9))
+		a.sync()
 		return
 	}
 }
@@ -518,14 +625,14 @@ func (a *App) equalize() {
 		ac, ar := walk(n.A)
 		bc, br := walk(n.B)
 		if n.Vertical {
-			n.Ratio = float32(ar) / float32(ar+br)
+			a.setRatio(n, float32(ar)/float32(ar+br))
 			return max(ac, bc), ar + br
 		}
-		n.Ratio = float32(ac) / float32(ac+bc)
+		a.setRatio(n, float32(ac)/float32(ac+bc))
 		return ac + bc, max(ar, br)
 	}
 	walk(t.Root)
-	a.changed()
+	a.sync()
 }
 
 func (a *App) toggleZoom() {
@@ -533,13 +640,13 @@ func (a *App) toggleZoom() {
 	if t == nil || t.Focus == nil {
 		return
 	}
-	if t.Zoom != nil {
-		t.Zoom = nil
-	} else if len(t.panes()) > 1 {
-		t.Zoom = t.Focus
+	zoom := t.Zoom == nil
+	if zoom && len(t.panes()) < 2 {
+		return
 	}
+	a.call("session.zoom_block", map[string]any{"block_id": t.Focus.Block, "zoom": zoom}, nil)
+	a.sync()
 	a.focusReq = t.Focus
-	a.changed()
 }
 
 // label returns how a pane names itself: its program, or the title the
@@ -572,7 +679,7 @@ func (p *Pane) label() (name, detail string) {
 
 // titleOfShell tells a title a shell set, naming the program or the
 // directory, from one a program set of its own.
-func titleOfShell(title string, in rex.SessionInfo) bool {
+func titleOfShell(title string, in rex.BlockInfo) bool {
 	l := strings.ToLower(title)
 	for _, w := range []string{strings.ToLower(in.Program), strings.ToLower(in.Shell)} {
 		// Windows's consoles title themselves with the shell's file:
@@ -643,167 +750,20 @@ func (t *Tab) label() (name, detail string) {
 	return t.Focus.label()
 }
 
-// The saved layout: the tabs, their splits and the sessions of their
-// panes, which the server keeps, and the app restores when it starts.
-type savedLayout struct {
-	Active int        `json:"active"`
-	Tabs   []savedTab `json:"tabs"`
-}
-
-type savedTab struct {
-	Name  string     `json:"name,omitempty"`
-	Root  *savedNode `json:"root"`
-	Focus int        `json:"focus"`
-	Zoom  bool       `json:"zoom,omitempty"`
-}
-
-type savedNode struct {
-	SID      string     `json:"sid,omitempty"`
-	Dir      string     `json:"dir,omitempty"`
-	Cols     int        `json:"cols,omitempty"`
-	Rows     int        `json:"rows,omitempty"`
-	Vertical bool       `json:"vertical,omitempty"`
-	Ratio    float32    `json:"ratio,omitempty"`
-	A        *savedNode `json:"a,omitempty"`
-	B        *savedNode `json:"b,omitempty"`
-}
-
-func (a *App) snapshot() savedLayout {
-	l := savedLayout{Active: a.active}
-	var save func(n *Node) *savedNode
-	save = func(n *Node) *savedNode {
-		if p := n.Pane; p != nil {
-			s := &savedNode{SID: p.SID, Dir: p.info.Dir}
-			if s.Dir == "" {
-				s.Dir = p.startDir
-			}
-			if p.term != nil {
-				s.Cols, s.Rows = p.term.Size()
-			}
-			return s
-		}
-		return &savedNode{Vertical: n.Vertical, Ratio: n.Ratio, A: save(n.A), B: save(n.B)}
-	}
-	for _, t := range a.tabs {
-		st := savedTab{Name: t.Name, Root: save(t.Root), Zoom: t.Zoom != nil}
-		st.Focus = max(slices.Index(t.panes(), t.Focus), 0)
-		l.Tabs = append(l.Tabs, st)
-	}
-	return l
-}
-
-// changed notes that the layout changed, to save it soon.
-func (a *App) changed() { a.saveDue = true }
-
-// save sends the layout to the server, which keeps it on disk.
-func (a *App) save() {
-	a.saveDue = false
-	if a.client == nil {
+// refreshInfos asks the server what runs in each block.
+func (a *App) refreshInfos() {
+	infos, err := a.client.List()
+	if err != nil {
 		return
 	}
-	b, err := json.Marshal(a.snapshot())
-	if err != nil || string(b) == a.lastSnapshot {
-		return
+	byID := make(map[string]rex.BlockInfo, len(infos))
+	for _, in := range infos {
+		byID[in.ID] = in
 	}
-	a.lastSnapshot = string(b)
-	a.lastSave = time.Now()
-	c := a.client
-	go c.SetLayout(b)
+	a.apply(byID)
 }
 
-// restore opens the tabs of the saved layout, attaching to the sessions
-// the server still has and starting new ones in place of those it lost.
-func (a *App) restore() bool {
-	raw, err := a.client.Layout()
-	if err != nil || len(raw) == 0 {
-		return false
-	}
-	var l savedLayout
-	if json.Unmarshal(raw, &l) != nil || len(l.Tabs) == 0 {
-		return false
-	}
-	live := map[string]rex.SessionInfo{}
-	if infos, err := a.client.List(); err == nil {
-		for _, in := range infos {
-			if !in.Exited {
-				live[in.ID] = in
-			}
-		}
-	}
-	used := map[string]bool{}
-	var load func(s *savedNode, t *Tab, parent *Node) *Node
-	load = func(s *savedNode, t *Tab, parent *Node) *Node {
-		n := &Node{ID: a.id(), Parent: parent}
-		if s.A == nil || s.B == nil {
-			var p *Pane
-			if in, ok := live[s.SID]; ok && !used[s.SID] {
-				used[s.SID] = true
-				p = &Pane{ID: a.id(), SID: s.SID, info: in, startDir: s.Dir}
-				a.attach(p, in.Cols, in.Rows)
-			} else {
-				dir := s.Dir
-				if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-					dir, _ = os.UserHomeDir()
-				}
-				p = a.newPane(dir, s.Cols, s.Rows)
-				p.restored = true
-			}
-			p.Tab, p.Node = t, n
-			n.Pane = p
-			return n
-		}
-		n.Vertical, n.Ratio = s.Vertical, min(max(s.Ratio, 0.05), 0.95)
-		n.A, n.B = load(s.A, t, n), load(s.B, t, n)
-		return n
-	}
-	for _, st := range l.Tabs {
-		if st.Root == nil {
-			continue
-		}
-		t := &Tab{ID: a.id(), Name: st.Name}
-		t.Root = load(st.Root, t, nil)
-		ps := t.panes()
-		for _, p := range ps {
-			t.setFocus(p)
-		}
-		t.setFocus(ps[min(max(st.Focus, 0), len(ps)-1)])
-		if st.Zoom && len(ps) > 1 {
-			t.Zoom = t.Focus
-		}
-		a.tabs = append(a.tabs, t)
-	}
-	// Sessions no tab shows, as those of another window that crashed,
-	// get a tab of their own rather than running unseen.
-	for _, in := range sortedInfos(live) {
-		if used[in.ID] {
-			continue
-		}
-		t := &Tab{ID: a.id()}
-		p := &Pane{ID: a.id(), SID: in.ID, info: in, startDir: in.Dir}
-		a.attach(p, in.Cols, in.Rows)
-		t.Root = &Node{ID: a.id(), Pane: p}
-		p.Tab, p.Node = t, t.Root
-		t.setFocus(p)
-		a.tabs = append(a.tabs, t)
-	}
-	if len(a.tabs) == 0 {
-		return false
-	}
-	a.active = min(max(l.Active, 0), len(a.tabs)-1)
-	a.focusReq = a.tab().Focus
-	return true
-}
-
-func sortedInfos(m map[string]rex.SessionInfo) []rex.SessionInfo {
-	out := make([]rex.SessionInfo, 0, len(m))
-	for _, in := range m {
-		out = append(out, in)
-	}
-	slices.SortFunc(out, func(a, b rex.SessionInfo) int { return a.Created.Compare(b.Created) })
-	return out
-}
-
-// poll asks the server what runs in each session, every half second,
+// poll asks the server what runs in each block, every half second,
 // until the window closes.
 func (a *App) poll(win *mygo.Window, client *rex.Client) {
 	tick := time.NewTicker(500 * time.Millisecond)
@@ -823,7 +783,7 @@ func (a *App) poll(win *mygo.Window, client *rex.Client) {
 		if err != nil {
 			continue
 		}
-		byID := make(map[string]rex.SessionInfo, len(infos))
+		byID := make(map[string]rex.BlockInfo, len(infos))
 		for _, in := range infos {
 			byID[in.ID] = in
 		}
@@ -835,11 +795,12 @@ func (a *App) poll(win *mygo.Window, client *rex.Client) {
 	}
 }
 
-// apply takes what the server said of the sessions.
-func (a *App) apply(byID map[string]rex.SessionInfo) {
+// apply takes what the server said of the blocks.
+func (a *App) apply(byID map[string]rex.BlockInfo) {
+	a.infos = byID
 	for ti, t := range a.tabs {
 		for _, p := range t.panes() {
-			in, ok := byID[p.SID]
+			in, ok := byID[p.Block]
 			if !ok {
 				continue
 			}
@@ -861,13 +822,7 @@ func (a *App) apply(byID map[string]rex.SessionInfo) {
 					n.Show()
 				}
 			}
-			if was.Dir != in.Dir {
-				a.changed()
-			}
 		}
-	}
-	if a.saveDue && time.Since(a.lastSave) > time.Second {
-		a.save()
 	}
 }
 

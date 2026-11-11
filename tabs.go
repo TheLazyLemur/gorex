@@ -137,8 +137,7 @@ func (a *App) renameField(c *ui.Context, t *Tab, name string) {
 	in := ui.TextInput(c, &a.renameText).Placeholder(name).Grow(1).MinWidth(0).Height(22).FontSize(13).AutoFocus()
 	done := func(keep bool) {
 		if keep {
-			t.Name = strings.TrimSpace(a.renameText)
-			a.changed()
+			a.setTabName(t, strings.TrimSpace(a.renameText))
 		}
 		a.renaming, a.renameFocus = nil, false
 		a.focusReq = t.Focus
@@ -173,26 +172,13 @@ func (a *App) tabBusy(c *ui.Context, t *Tab) bool {
 	return false
 }
 
-func (a *App) moveTab(t *Tab, to int) {
-	from := slices.Index(a.tabs, t)
-	if from < 0 || to == from {
-		return
-	}
-	activeTab := a.tab()
-	a.tabs = slices.Delete(a.tabs, from, from+1)
-	a.tabs = slices.Insert(a.tabs, min(to, len(a.tabs)), t)
-	a.active = slices.Index(a.tabs, activeTab)
-	a.changed()
-}
-
 func (a *App) tabMenu(m *ui.Menu, t *Tab) {
 	if m.Item("Rename Tab…").Chosen() {
 		a.selectTab(slices.Index(a.tabs, t))
 		a.startRename()
 	}
 	if t.Name != "" && m.Item("Reset Name").Chosen() {
-		t.Name = ""
-		a.changed()
+		a.setTabName(t, "")
 	}
 	m.Separator()
 	i := slices.Index(a.tabs, t)

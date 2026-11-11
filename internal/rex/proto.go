@@ -1,10 +1,13 @@
-// Package rex is GoRex's session server and its client.
+// Package rex is GoRex's server and its client.
 //
-// The server owns the pseudo-terminals: shells keep running when the app
-// quits, and the next launch attaches to them again, with what they printed
-// replayed. The app talks to it over a Unix socket: a control connection of
-// JSON lines (requests and their responses), and one connection per
-// attached session that carries the terminal's bytes both ways.
+// The server owns the pseudo-terminals and how they are laid out: as
+// Rex's, it holds sessions, whose windows (the app's tabs) hold layouts of
+// blocks, each block a terminal. Shells keep running when the app quits,
+// and the next launch attaches to them again, with what they printed
+// replayed. The app talks to it over a Unix socket: a control connection
+// of JSON lines (requests, their responses, and events), and one
+// connection per attached block that carries the terminal's bytes both
+// ways.
 package rex
 
 import (
@@ -17,38 +20,44 @@ import (
 )
 
 // ProtocolVersion changes whenever the wire protocol does.
-const ProtocolVersion = 1
+const ProtocolVersion = 2
 
-// Request is a line of the control connection, from the client.
+// Request is a line of the control connection, from the client: a call
+// of one of Rex's methods, by Method and Params, or one of GoRex's own
+// operations, by Op.
 type Request struct {
 	ID     int64           `json:"id"`
-	Op     string          `json:"op"`
+	Method string          `json:"method,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
+	Op     string          `json:"op,omitempty"`
 	SID    string          `json:"sid,omitempty"`
 	Cols   int             `json:"cols,omitempty"`
 	Rows   int             `json:"rows,omitempty"`
-	Create *CreateOptions  `json:"create,omitempty"`
-	Layout json.RawMessage `json:"layout,omitempty"`
 }
 
-// Response answers the Request with the same ID.
+// Response answers the Request with the same ID. A line with an Event and
+// no ID is an event of a session the connection attached to.
 type Response struct {
-	ID    int64           `json:"id"`
+	ID    int64           `json:"id,omitempty"`
 	Error string          `json:"error,omitempty"`
+	Code  string          `json:"code,omitempty"`
 	Data  json.RawMessage `json:"data,omitempty"`
+	Event *Event          `json:"event,omitempty"`
 }
 
-// CreateOptions start a session.
-type CreateOptions struct {
+// BlockOptions are the options of a terminal block, as a layout gives
+// them: Rex documents command; cwd and the size are GoRex's own.
+type BlockOptions struct {
 	// Command runs instead of the user's login shell.
 	Command []string `json:"command,omitempty"`
-	Dir     string   `json:"dir,omitempty"`
+	Dir     string   `json:"cwd,omitempty"`
 	Env     []string `json:"env,omitempty"`
 	Cols    int      `json:"cols,omitempty"`
 	Rows    int      `json:"rows,omitempty"`
 }
 
-// SessionInfo describes a session and what runs in it now.
-type SessionInfo struct {
+// BlockInfo describes a block and what runs in it now.
+type BlockInfo struct {
 	ID      string    `json:"id"`
 	PID     int       `json:"pid"`
 	Shell   string    `json:"shell"`
@@ -100,7 +109,7 @@ type HostInfo struct {
 	Portable bool `json:"portable,omitempty"`
 }
 
-// Attach is the first line of a connection attaching to a session.
+// Attach is the first line of a connection attaching to a block.
 type Attach struct {
 	Op   string `json:"op"` // "attach"
 	SID  string `json:"sid"`

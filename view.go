@@ -36,9 +36,6 @@ func (a *App) view(c *ui.Context) {
 	}
 	a.shortcuts(c)
 	a.palette(c, k)
-	if a.saveDue && time.Since(a.lastSave) > time.Second {
-		a.save()
-	}
 	// The window's title, which the Window menu and Mission Control show,
 	// is the active tab's.
 	if t := a.tab(); t != nil && a.win != nil {
@@ -198,13 +195,11 @@ func (a *App) node(c *ui.Context, k *colors, t *Tab, n *Node) ui.Element {
 				total, d = bounds.H-gap, dy
 			}
 			if total > 0 {
-				n.Ratio = min(max(n.Ratio+d/total, 0.08), 0.92)
-				a.changed()
+				a.setRatio(n, min(max(n.Ratio+d/total, 0.08), 0.92))
 			}
 		}
 		if div.DoubleClicked() {
-			n.Ratio = 0.5
-			a.changed()
+			a.setRatio(n, 0.5)
 		}
 		if div.Hovered() || div.Dragging() || div.Pressed() {
 			div.Draw(func(p *ui.Painter, r ui.Rect) {
@@ -246,8 +241,7 @@ func (a *App) paneCard(c *ui.Context, k *colors, t *Tab, p *Pane) ui.Element {
 				a.focusReq = nil
 			}
 			if tv.Focused() && t.Focus != p {
-				t.setFocus(p)
-				a.changed()
+				a.focus(p)
 			}
 			if tv.Focused() {
 				p.attention = false
@@ -256,7 +250,7 @@ func (a *App) paneCard(c *ui.Context, k *colors, t *Tab, p *Pane) ui.Element {
 	})
 	p.bounds = card.Bounds()
 	if card.Pressed() && t.Focus != p {
-		t.setFocus(p)
+		a.focus(p)
 		a.focusReq = p
 	}
 	return card
@@ -272,11 +266,11 @@ func (a *App) paneHeader(c *ui.Context, k *colors, t *Tab, p *Pane, focused, hov
 	}
 	h := ui.Row(c).Height(headerH).Padding(0, 8, 0, 12).Gap(7).AlignItems(ui.Center).MinWidth(0)
 	if h.DoubleClicked() {
-		t.setFocus(p)
+		a.focus(p)
 		a.toggleZoom()
 	}
 	if h.Clicked() {
-		t.setFocus(p)
+		a.focus(p)
 		a.focusReq = p
 	}
 	h.Children(func() {
@@ -294,11 +288,11 @@ func (a *App) paneHeader(c *ui.Context, k *colors, t *Tab, p *Pane, focused, hov
 				return
 			}
 			if iconButton(c, k, "columns-2", "Split Right", 26, 16).Tooltip(tip("Split Right", &cmdSplitRight)).Clicked() {
-				t.setFocus(p)
+				a.focus(p)
 				a.split(false)
 			}
 			if iconButton(c, k, "rows-2", "Split Down", 26, 16).Tooltip(tip("Split Down", &cmdSplitDown)).Clicked() {
-				t.setFocus(p)
+				a.focus(p)
 				a.split(true)
 			}
 			zoom, label := "maximize-2", "Zoom"
@@ -306,7 +300,7 @@ func (a *App) paneHeader(c *ui.Context, k *colors, t *Tab, p *Pane, focused, hov
 				zoom, label = "minimize-2", "Unzoom"
 			}
 			if iconButton(c, k, zoom, "Zoom", 26, 16).Tooltip(tip(label, &cmdZoom)).Clicked() {
-				t.setFocus(p)
+				a.focus(p)
 				a.toggleZoom()
 			}
 			if iconButton(c, k, "x", "Close Pane", 26, 17).Tooltip(tip("Close Pane", &cmdClosePane)).Clicked() {

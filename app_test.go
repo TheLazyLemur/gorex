@@ -67,7 +67,7 @@ func newTestApp(t *testing.T) (*App, *ui.Tester) {
 	})
 	registerFonts()
 	a := &App{client: client}
-	a.newTab(os.TempDir())
+	a.start()
 	tt := ui.NewTester(a.view, 1000, 620)
 	return a, tt
 }
@@ -76,7 +76,7 @@ func newTestApp(t *testing.T) (*App, *ui.Tester) {
 // every half second.
 func refresh(a *App) {
 	infos, _ := a.client.List()
-	byID := map[string]rex.SessionInfo{}
+	byID := map[string]rex.BlockInfo{}
 	for _, in := range infos {
 		byID[in.ID] = in
 	}
@@ -149,7 +149,7 @@ func TestPanesAndTabs(t *testing.T) {
 
 	// Typing reaches the shell, and the header follows its directory.
 	a.focusReq = p
-	tab.setFocus(p)
+	a.focus(p)
 	tt.Frame()
 	tt.Type(testShell.run)
 	tt.Key(0, ui.KeyEnter)
@@ -179,7 +179,7 @@ func TestPanesAndTabs(t *testing.T) {
 
 	// A shell that exits closes its pane.
 	a.selectTab(0)
-	tab.setFocus(right)
+	a.focus(right)
 	right.term.Send([]byte("exit\r"))
 	waitFor(t, tt, "the pane to close", func() bool { return len(tab.panes()) == 2 })
 }
@@ -187,23 +187,20 @@ func TestPanesAndTabs(t *testing.T) {
 func TestRestore(t *testing.T) {
 	a, tt := newTestApp(t)
 	a.split(false)
-	a.tab().Root.Ratio = 0.3
+	a.setRatio(a.tab().Root, 0.3)
 	a.newTab(testShell.dir)
-	a.tabs[1].Name = "second"
+	a.setTabName(a.tabs[1], "second")
 	tt.Frame()
-	a.saveNow()
-	sids := map[string]bool{}
+	blocks := map[string]bool{}
 	for _, tab := range a.tabs {
 		for _, p := range tab.panes() {
-			sids[p.SID] = true
+			blocks[p.Block] = true
 			p.term.Close() // detach, as when the app quits
 		}
 	}
 	// Another app, as the next launch, finds them all.
 	b := &App{client: a.client}
-	if !b.restore() {
-		t.Fatal("nothing restored")
-	}
+	b.start()
 	if len(b.tabs) != 2 || b.tabs[1].Name != "second" || b.active != 1 {
 		t.Fatalf("restored %d tabs, active %d", len(b.tabs), b.active)
 	}
@@ -212,8 +209,8 @@ func TestRestore(t *testing.T) {
 	}
 	for _, tab := range b.tabs {
 		for _, p := range tab.panes() {
-			if !sids[p.SID] || p.restored {
-				t.Errorf("pane of session %q not attached again", p.SID)
+			if !blocks[p.Block] {
+				t.Errorf("pane of block %q not attached again", p.Block)
 			}
 		}
 	}
@@ -222,11 +219,11 @@ func TestRestore(t *testing.T) {
 func TestLabels(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	site, short := filepath.Join(home, "Sites", "rex-snake"), filepath.Join("~", "Sites", "rex-snake")
-	p := &Pane{info: rex.SessionInfo{Shell: "zsh", Program: "zsh", Idle: true, Dir: site}}
+	p := &Pane{info: rex.BlockInfo{Shell: "zsh", Program: "zsh", Idle: true, Dir: site}}
 	if n, d := p.label(); n != "zsh" || d != short {
 		t.Errorf("shell label %q %q", n, d)
 	}
-	p.info = rex.SessionInfo{Shell: "fish", Program: "lazygit", Dir: site}
+	p.info = rex.BlockInfo{Shell: "fish", Program: "lazygit", Dir: site}
 	p.title = "lazygit ~/Sites/rex-snake"
 	if n, d := p.label(); n != "Git Changes" || d != short {
 		t.Errorf("lazygit label %q %q", n, d)
@@ -236,12 +233,12 @@ func TestLabels(t *testing.T) {
 	if n, d := p.label(); n != p.title || d != "" {
 		t.Errorf("codex label %q %q", n, d)
 	}
-	p.info, p.title = rex.SessionInfo{Shell: "zsh", Program: "ssh", Args: []string{"ssh", "-p", "22", "box.local"}}, ""
+	p.info, p.title = rex.BlockInfo{Shell: "zsh", Program: "ssh", Args: []string{"ssh", "-p", "22", "box.local"}}, ""
 	if n, d := p.label(); n != "SSH" || d != "box.local" {
 		t.Errorf("ssh label %q %q", n, d)
 	}
 	// Windows's consoles name the shell in their title as a program runs.
-	p.info, p.title = rex.SessionInfo{Shell: "cmd", Program: "node", Dir: site}, `C:\WINDOWS\system32\cmd.exe - node app.js`
+	p.info, p.title = rex.BlockInfo{Shell: "cmd", Program: "node", Dir: site}, `C:\WINDOWS\system32\cmd.exe - node app.js`
 	if n, d := p.label(); n != "Node" || d != short {
 		t.Errorf("node label %q %q", n, d)
 	}
@@ -305,7 +302,7 @@ func TestPaletteScrolls(t *testing.T) {
 	a := &App{}
 	tab := &Tab{ID: 1}
 	for i := range 20 {
-		n := &Node{Pane: &Pane{ID: i, Tab: tab, info: rex.SessionInfo{Shell: fmt.Sprintf("shell%02d", i)}}}
+		n := &Node{Pane: &Pane{ID: i, Tab: tab, info: rex.BlockInfo{Shell: fmt.Sprintf("shell%02d", i)}}}
 		n.Pane.Node = n
 		if tab.Root == nil {
 			tab.Root = n

@@ -270,33 +270,33 @@ func (a *App) clearFocused() {
 	}
 }
 
-// restartFocused ends the focused pane's session and starts a shell in
-// its place, in the same directory.
+// restartFocused ends the focused pane's block and starts a shell in its
+// place, in the same directory: a split of it, which takes its place as
+// it closes.
 func (a *App) restartFocused() {
 	t := a.tab()
 	if t == nil || t.Focus == nil {
 		return
 	}
-	old := t.Focus
+	old, zoomed := t.Focus, t.Zoom != nil
 	cols, rows := 80, 24
 	if old.term != nil {
 		cols, rows = old.term.Size()
 	}
-	p := a.newPane(a.currentDir(), cols, rows)
-	p.Tab, p.Node = t, old.Node
-	old.Node.Pane = p
-	old.closed = true
-	if old.term != nil {
-		old.term.Close()
+	var sp struct {
+		BlockIDs []string `json:"block_ids"`
 	}
-	go a.client.Kill(old.SID)
-	if t.Zoom == old {
-		t.Zoom = p
+	if a.call("session.new_split", map[string]any{
+		"anchor_id": old.Block, "direction": "horizontal", "side": "after",
+		"layout": shell(a.currentDir(), cols, rows), "focus": true,
+	}, &sp) != nil {
+		return
 	}
-	t.Focus = nil
-	t.setFocus(p)
-	a.focusReq = p
-	a.changed()
+	a.call("block.close", map[string]any{"block_id": old.Block}, nil)
+	if zoomed {
+		a.call("session.zoom_block", map[string]any{"block_id": sp.BlockIDs[0], "zoom": true}, nil)
+	}
+	a.sync()
 }
 
 func (a *App) quitAndEnd() {
@@ -361,13 +361,13 @@ func (a *App) paletteItems() []paletteItem {
 			if !match(fmt.Sprintf("%s %s tab %d", name, detail, ti+1)) {
 				continue
 			}
-			ti, t, p := ti, t, p
+			ti, p := ti, p
 			items = append(items, paletteItem{
 				title: name, detail: detail, glyph: paneProgram(p).Glyph,
 				keys: fmt.Sprintf("Tab %d", ti+1),
 				run: func() {
 					a.selectTab(ti)
-					t.setFocus(p)
+					a.focus(p)
 					a.focusReq = p
 				},
 			})

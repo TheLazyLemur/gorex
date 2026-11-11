@@ -8,7 +8,6 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"os"
 	"runtime"
@@ -57,9 +56,6 @@ func main() {
 		if runtime.GOOS != "darwin" {
 			mygo.App.Quit()
 		}
-	})
-	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
-		a.saveNow()
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
@@ -112,21 +108,18 @@ func (a *App) open() {
 	}
 	win := mygo.NewWindow(opts)
 	a.win = win
-	if !a.restore() {
-		home, _ := os.UserHomeDir()
-		a.newTab(home)
+	if a.err == "" {
+		a.start()
 	}
-	a.changed()
 	go a.poll(win, client)
 	a.debugHook()
 	win.OnClosed(func() {
-		a.saveNow()
 		a.quitting = true
 		for _, t := range a.tabs {
 			for _, p := range t.panes() {
 				p.closed = true
 				if p.term != nil {
-					p.term.Close() // detaches: the session goes on
+					p.term.Close() // detaches: the block goes on
 				}
 			}
 		}
@@ -135,32 +128,13 @@ func (a *App) open() {
 	})
 }
 
-// saveNow sends the layout to the server and waits for it to be kept.
-func (a *App) saveNow() {
-	if a.client == nil || len(a.tabs) == 0 && !a.quitting {
-		return
-	}
-	b, err := json.Marshal(a.snapshot())
-	if err != nil {
-		return
-	}
-	done := make(chan struct{})
-	go func() {
-		a.client.SetLayout(b)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-	}
-}
-
 // reset forgets the state of a window that closed, keeping the server's
 // connection, for the next window.
 func (a *App) reset() {
-	a.tabs, a.active, a.focusReq = nil, 0, nil
+	a.tabs, a.active, a.focusReq, a.panes = nil, 0, nil, nil
+	a.session, a.revision = "", 0
 	a.paletteOpen, a.hostOpen, a.renaming = false, false, nil
-	a.saveDue, a.quitting, a.lastSnapshot, a.title = false, false, "", ""
+	a.quitting, a.title = false, ""
 }
 
 // staleServer reports whether the server runs another build of the app
