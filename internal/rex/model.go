@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -21,7 +22,10 @@ import (
 // blocks by when they had the focus last, the latest last, so that
 // closing a block gives the focus back to the one before.
 type rsession struct {
-	view   SessionView
+	view SessionView
+	// chosen is the label the server picked for the session, which an
+	// empty session.set_label restores.
+	chosen string
 	recent map[string][]string
 }
 
@@ -50,11 +54,12 @@ func (s *Server) call(c *ctrl, method string, params json.RawMessage) (any, erro
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		chosen := s.newSessionLabel()
 		label := strings.TrimSpace(p.Label)
 		if label == "" {
-			label = s.newSessionLabel()
+			label = chosen
 		}
-		rs := &rsession{view: SessionView{ID: newID("session"), Label: label, Windows: []*WindowView{}}, recent: map[string][]string{}}
+		rs := &rsession{view: SessionView{ID: newID("session"), Label: label, Windows: []*WindowView{}}, chosen: chosen, recent: map[string][]string{}}
 		s.rsessions = append(s.rsessions, rs)
 		return map[string]string{"session_id": rs.view.ID, "label": label}, nil
 
@@ -361,6 +366,75 @@ func (s *Server) call(c *ctrl, method string, params json.RawMessage) (any, erro
 		}
 		sp.Ratio = p.Ratio
 		s.bump(rs)
+		return nil, nil
+
+	case "session.set_label":
+		var p struct {
+			SessionID string `json:"session_id"`
+			Label     string `json:"label"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		label := strings.TrimSpace(p.Label)
+		if err := checkLabel(label); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		rs, err := s.rsession(p.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		if label == "" {
+			label = rs.chosen
+		}
+		if rs.view.Label != label {
+			rs.view.Label = label
+			s.emit(rs, "session_label_changed", map[string]string{"label": label})
+			s.bump(rs)
+		}
+		return nil, nil
+
+	case "session.set_block_label":
+		var p struct {
+			SessionID string `json:"session_id"`
+			BlockID   string `json:"block_id"`
+			Label     string `json:"label"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		label := strings.TrimSpace(p.Label)
+		if err := checkLabel(label); err != nil {
+			return nil, err
+		}
+		if p.BlockID == "" {
+			return nil, apiErr(CodeBadRequest, "set_block_label needs a block_id")
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		rs, err := s.rsession(p.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		var b *LayoutBlock
+		if w := rs.windowOf(p.BlockID); w != nil {
+			// windowOf also finds splits, which have no label.
+			if n, _ := find(w.Layout, p.BlockID); n.Block != nil {
+				b = n.Block
+			}
+		}
+		if b == nil {
+			return nil, apiErr(CodeNotFound, "block %s is not in the session", p.BlockID)
+		}
+		if label == "" {
+			label = DefaultBlockLabel(b.ID)
+		}
+		if b.Label != label {
+			b.Label = label
+			s.bump(rs)
+		}
 		return nil, nil
 
 	case "session.set_window_label":
@@ -911,16 +985,17 @@ func cmp(v, def float64) float64 {
 	return v
 }
 
-// newSessionLabel picks a label no session has, as Rex's quiet-meadow.
+// newSessionLabel picks a label no session has, nor has chosen, as Rex's
+// quiet-meadow. Once every pair is taken it adds a number.
 func (s *Server) newSessionLabel() string {
 	adj := []string{"quiet", "bright", "calm", "swift", "amber", "misty", "golden", "silver", "gentle", "bold"}
 	noun := []string{"meadow", "river", "harbor", "forest", "canyon", "summit", "valley", "island", "garden", "comet"}
-	for {
-		l := adj[mrand.IntN(len(adj))] + "-" + noun[mrand.IntN(len(noun))]
-		if !slices.ContainsFunc(s.rsessions, func(rs *rsession) bool { return rs.view.Label == l }) {
-			return l
-		}
+	base := adj[mrand.IntN(len(adj))] + "-" + noun[mrand.IntN(len(noun))]
+	l := base
+	for n := 2; slices.ContainsFunc(s.rsessions, func(rs *rsession) bool { return rs.view.Label == l || rs.chosen == l }); n++ {
+		l = base + "-" + strconv.Itoa(n)
 	}
+	return l
 }
 
 // savedState is what the server keeps on disk, to start its sessions
@@ -931,6 +1006,7 @@ type savedState struct {
 
 type savedSession struct {
 	View   SessionView             `json:"view"`
+	Chosen string                  `json:"chosen,omitempty"`
 	Recent map[string][]string     `json:"recent,omitempty"`
 	Blocks map[string]BlockOptions `json:"blocks"`
 }
@@ -946,7 +1022,7 @@ func (s *Server) save() {
 	st := savedState{Sessions: []savedSession{}}
 	blocks := map[string]*block{}
 	for _, rs := range s.rsessions {
-		ss := savedSession{View: rs.view, Recent: rs.recent, Blocks: map[string]BlockOptions{}}
+		ss := savedSession{View: rs.view, Chosen: rs.chosen, Recent: rs.recent, Blocks: map[string]BlockOptions{}}
 		for _, w := range rs.view.Windows {
 			for _, id := range w.Layout.Blocks() {
 				blocks[id] = s.blocks[id]
@@ -1001,7 +1077,10 @@ func (s *Server) load() {
 		return
 	}
 	for _, ss := range st.Sessions {
-		rs := &rsession{view: ss.View, recent: ss.Recent}
+		rs := &rsession{view: ss.View, chosen: ss.Chosen, recent: ss.Recent}
+		if rs.chosen == "" { // saved before the server kept it
+			rs.chosen = rs.view.Label
+		}
 		if rs.recent == nil {
 			rs.recent = map[string][]string{}
 		}
