@@ -290,3 +290,187 @@ func TestSessions(t *testing.T) {
 		t.Errorf("blocks after a restart %+v", list)
 	}
 }
+
+// TestRelabel sets and restores the labels of a session and of a block,
+// through Rex's methods, and checks that they and the label the server
+// chose outlive a restart.
+func TestRelabel(t *testing.T) {
+	dir := testDir(t)
+	c, done := serve(t, dir)
+	events := make(chan Event, 256)
+	c.OnEvent(func(e Event) { events <- e })
+	var sess struct {
+		ID string `json:"session_id"`
+	}
+	if err := c.Call("session.create", map[string]any{"label": "mine"}, &sess); err != nil {
+		t.Fatal(err)
+	}
+	sid := sess.ID
+	call := func(method string, params map[string]any) {
+		t.Helper()
+		params["session_id"] = sid
+		if err := c.Call(method, params, nil); err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+	}
+	listed := func() string {
+		t.Helper()
+		var out struct {
+			Sessions []struct {
+				ID    string `json:"session_id"`
+				Label string `json:"label"`
+			} `json:"sessions"`
+		}
+		if err := c.Call("session.list", map[string]any{}, &out); err != nil || len(out.Sessions) != 1 {
+			t.Fatalf("list %+v %v", out, err)
+		}
+		return out.Sessions[0].Label
+	}
+	view := func() SessionView {
+		t.Helper()
+		var v SessionView
+		if err := c.Call("session.view", map[string]any{"session_id": sid}, &v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	// sent drains the events heard so far, by type.
+	sent := func() (types []string) {
+		t.Helper()
+		time.Sleep(100 * time.Millisecond)
+		for len(events) > 0 {
+			var se SessionEvent
+			json.Unmarshal((<-events).Payload, &se)
+			types = append(types, se.Event.Type)
+		}
+		return types
+	}
+	call("session.attach", map[string]any{})
+
+	// A new label is trimmed, shown in the list and the view, and sent as
+	// its event and then the view's; the same label again sends nothing.
+	call("session.set_label", map[string]any{"label": "  work "})
+	if v := view(); listed() != "work" || v.Label != "work" {
+		t.Fatalf("list %q view %q", listed(), v.Label)
+	}
+	if got := sent(); !slices.Equal(got, []string{"session_label_changed", "session_view_changed"}) {
+		t.Errorf("events %v", got)
+	}
+	revision := view().Revision
+	call("session.set_label", map[string]any{"label": "work"})
+	if got := sent(); len(got) != 0 || view().Revision != revision {
+		t.Errorf("setting the same label sent %v, revision %d to %d", got, revision, view().Revision)
+	}
+
+	// An empty label restores the label the server chose, though the
+	// session was created with one of its own; so does a missing one.
+	call("session.set_label", map[string]any{"label": " "})
+	chosen := listed()
+	if chosen == "" || chosen == "mine" || chosen == "work" {
+		t.Fatalf("restored label %q", chosen)
+	}
+	call("session.set_label", map[string]any{"label": "again"})
+	call("session.set_label", map[string]any{})
+	if listed() != chosen {
+		t.Errorf("a missing label restored %q, not %q", listed(), chosen)
+	}
+
+	// A new block has no label until one is set; clearing it restores the
+	// default made from its ID.
+	var w struct {
+		BlockIDs []string `json:"block_ids"`
+	}
+	if err := c.Call("session.new_window", map[string]any{"session_id": sid, "layout": &LayoutNode{Split: &LayoutSplit{Direction: "horizontal", Before: shellBlock(), After: shellBlock()}}}, &w); err != nil {
+		t.Fatal(err)
+	}
+	first, second := w.BlockIDs[0], w.BlockIDs[1]
+	labels := func() (string, string) {
+		t.Helper()
+		l := view().Windows[0].Layout.Split
+		return l.Before.Block.Label, l.After.Block.Label
+	}
+	if a, b := labels(); a != "" || b != "" {
+		t.Fatalf("new blocks' labels %q %q", a, b)
+	}
+	sent()
+	call("session.set_block_label", map[string]any{"block_id": first, "label": " build "})
+	if a, b := labels(); a != "build" || b != "" {
+		t.Fatalf("labels %q %q", a, b)
+	}
+	if got := sent(); !slices.Equal(got, []string{"session_view_changed"}) {
+		t.Errorf("events %v", got)
+	}
+	call("session.set_block_label", map[string]any{"block_id": second, "label": "logs"})
+	call("session.set_block_label", map[string]any{"block_id": second})
+	if _, b := labels(); b != DefaultBlockLabel(second) || !strings.HasPrefix(b, "Block ") {
+		t.Errorf("a missing label restored %q", b)
+	}
+
+	// Errors carry Rex's codes.
+	split := view().Windows[0].Layout.Split.ID
+	for _, tc := range []struct {
+		method string
+		params map[string]any
+		code   string
+	}{
+		{"session.set_label", map[string]any{"session_id": "session:nope", "label": "x"}, CodeSessionNotFound},
+		{"session.set_label", map[string]any{"session_id": sid, "label": strings.Repeat("x", 129)}, CodeBadRequest},
+		{"session.set_label", map[string]any{"session_id": sid, "label": "a\tb"}, CodeBadRequest},
+		{"session.set_label", map[string]any{"session_id": sid, "lable": "x"}, CodeBadRequest},
+		{"session.set_block_label", map[string]any{"session_id": "session:nope", "block_id": first}, CodeSessionNotFound},
+		{"session.set_block_label", map[string]any{"session_id": sid, "label": "x"}, CodeBadRequest},
+		{"session.set_block_label", map[string]any{"session_id": sid, "block_id": first, "label": strings.Repeat("x", 129)}, CodeBadRequest},
+		{"session.set_block_label", map[string]any{"session_id": sid, "block_id": first, "label": "a\nb"}, CodeBadRequest},
+		{"session.set_block_label", map[string]any{"session_id": sid, "block_id": first, "lable": "x"}, CodeBadRequest},
+		{"session.set_block_label", map[string]any{"session_id": sid, "block_id": "block:nope", "label": "x"}, CodeNotFound},
+		{"session.set_block_label", map[string]any{"session_id": sid, "block_id": split, "label": "x"}, CodeNotFound},
+	} {
+		var ae *APIError
+		if err := c.Call(tc.method, tc.params, nil); !errors.As(err, &ae) || ae.Code != tc.code {
+			t.Errorf("%s %v: %v, not %s", tc.method, tc.params, err, tc.code)
+		}
+	}
+	if a, _ := labels(); a != "build" || listed() != chosen {
+		t.Errorf("a failed call changed a label: %q, %q", a, listed())
+	}
+
+	// The labels and the chosen one outlive a restart.
+	call("session.set_label", map[string]any{"label": "kept"})
+	c.Shutdown()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	c, _ = serve(t, dir)
+	defer c.Shutdown()
+	if a, _ := labels(); a != "build" || listed() != "kept" {
+		t.Fatalf("after a restart: block %q session %q", a, listed())
+	}
+	call("session.set_label", map[string]any{})
+	if listed() != chosen {
+		t.Errorf("after a restart an empty label restored %q, not %q", listed(), chosen)
+	}
+}
+
+func TestNewSessionLabel(t *testing.T) {
+	// given
+	// ... a session called "mine" that holds a chosen label
+	s := &Server{rsessions: []*rsession{{view: SessionView{Label: "mine"}, chosen: "quiet-meadow"}}}
+
+	// when
+	// ... more labels are picked than there are adjective-noun pairs
+	seen := map[string]bool{"quiet-meadow": true}
+	for range 150 {
+		l := s.newSessionLabel()
+		if seen[l] {
+			t.Fatalf("%q was picked twice", l)
+		}
+		seen[l] = true
+		s.rsessions = append(s.rsessions, &rsession{view: SessionView{Label: l}, chosen: l})
+	}
+
+	// then
+	// ... none repeats, and none loops forever
+	if len(seen) != 151 {
+		t.Errorf("%d distinct labels", len(seen))
+	}
+}
