@@ -55,7 +55,7 @@ The work is done in phases. Each phase depends on the one before it.
 | Phase | Delivers |
 | --- | --- |
 | 0 | A parity checklist derived from the reference pages, and a parity test that enforces the action table |
-| 1 | The server owns the model: sessions, windows, blocks, layers, clients; Rex's methods and events; the app becomes a client |
+| 1 | The server owns the model: sessions, windows, blocks, clients; Rex's methods and events; the app becomes a client |
 | 2 | The `rex` CLI |
 | 3 | Rex's action names and default shortcuts; `init.lua` with bindings, sequences, modes and custom actions; `rex do` scripts and Lua events |
 | 4 | The rest of the Mac client: multiple sessions and windows, sidebar and Activity, floating panes, remaining pane and tab actions, find, prompts, Go to Anything, Quick Look |
@@ -143,7 +143,7 @@ The work is done in phases. Each phase depends on the one before it.
 59. As a user, I want tabs I can close (others too), rename, go to by number (`⌘1…9`), move backward and forward (`⌃⇧PageUp`/`PageDown`) and move to a new window, so that tab management matches Rex.
 60. As a user, I want to split left, right, up, down and best fit (`⇧⌘←`, `⌘D`, `⇧⌘↑`, `⇧⌘D`, `⌘↩`), so that I can split any way.
 61. As a user, I want to move panes (`⌥⇧⌘`+arrows), swap them, move a pane to a new tab or another tab, close other panes, balance splits and resize, so that I can rearrange a layout.
-62. As a user, I want floating panes: float a pane (`⌥⌘↩`), a new floating pane, minimise one (`⌥⌘M`) or all (`⌥⇧⌘↩`), raise, lower and resize them, so that I can keep a terminal on top.
+62. As a user, I want floating panes: float a pane (`⌥⌘↩`), a new floating pane, minimise one (`⌥⌘M`) or all (`⌥⇧⌘↩`), raise, lower and resize them, held by the server as layers on the window, so that I can keep a terminal on top.
 63. As a user, I want Zoom Pane (`⇧⌘↩`), Rename Pane, Copy Pane ID, Paste into Pane, Copy from Pane, Select All in Pane and Send Key (`⌘⌫`), so that pane actions match Rex.
 64. As a user, I want Find (`⌘F`, `⌘G`, `⇧⌘G`) in a pane's scrollback, so that I can search output.
 65. As a user, I want Jump to Previous/Next Prompt (`⌘↑`/`⌘↓`) using OSC 133, so that I can move between commands.
@@ -200,7 +200,7 @@ The work is done in phases. Each phase depends on the one before it.
   give; see Open Questions.
 - **The server owns the model.** The session server stops storing the app's
   layout as an opaque blob. It holds sessions → windows → layouts of blocks,
-  plus floating layers, focus, zoom and labels, and every change goes through
+  plus focus, zoom and labels, and every change goes through
   an API method and emits events. The app keeps no layout state of its own: it
   renders `session.view` and applies `session_view_changed`.
 - **Blocks have creators.** A block is created by a block creator; the
