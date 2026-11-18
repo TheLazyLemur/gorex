@@ -112,11 +112,17 @@ func newID(kind string) string {
 
 // DefaultWindowLabel is a window's label when it has none of its own, as
 // Rex makes it from the window's ID: "Window 89abcdef".
-func DefaultWindowLabel(id string) string {
+func DefaultWindowLabel(id string) string { return defaultLabel("Window", id) }
+
+// DefaultBlockLabel is a block's label when it has none of its own, made
+// from its ID: "Block 89abcdef".
+func DefaultBlockLabel(id string) string { return defaultLabel("Block", id) }
+
+func defaultLabel(kind, id string) string {
 	if len(id) < 8 {
-		return "Window"
+		return kind
 	}
-	return "Window " + id[len(id)-8:]
+	return kind + " " + id[len(id)-8:]
 }
 
 // Blocks returns the IDs of a layout's blocks in order, left to right and
