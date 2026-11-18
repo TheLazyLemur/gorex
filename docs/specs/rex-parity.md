@@ -74,7 +74,7 @@ The work is done in phases. Each phase depends on the one before it.
 5. As a user, I want to give sessions, windows, blocks and clients labels I can change, so that I can refer to them by name.
 6. As a user, I want the layout to live on the server, so that two apps attached to the same session see the same windows and splits.
 7. As a user, I want the server to tell every attached client when the layout changes (`session_view_changed` with a `revision`), so that all clients stay in step.
-8. As a user upgrading GoRex, I want my current tabs, splits and running programs carried into the new model, so that the upgrade doesn't lose my work.
+8. As a user upgrading GoRex, I accept a one-time reset: the first server of the new model deletes the old saved layout (`layout.json`) once and starts with a fresh session, so that the new server never has to read the old format.
 
 ### Server API (phase 1)
 
@@ -290,9 +290,6 @@ The work is done in phases. Each phase depends on the one before it.
   and Scrollback have no Rex action. Keep them under new names, or drop them?
   `block.set_font_size` is decided (see Implementation Decisions); its CLI
   command name isn't.
-- **Upgrade path.** Migrate the current saved layout and running sessions into
-  the new model, or accept a one-time reset? A migration needs the old format
-  to be readable by the new server.
 - **State and binary names.** Rex's state locations, socket path and
   `REX_*` variables vs GoRex's current `GOREX_DIR`. Adopting Rex's exactly
   means GoRex and a real Rex can't be installed side by side.
@@ -314,10 +311,6 @@ The work is done in phases. Each phase depends on the one before it.
 
 ## Further Notes
 
-- **The code disagrees with the spec.** The server stores the app's layout as
-  an opaque blob and knows only flat PTY sessions. The app owns tabs, splits,
-  focus and zoom. That is the reverse of Rex's design and the reason phase 1
-  comes first.
 - **Vocabulary changes.** GoRex's "session" (one PTY) becomes a terminal
   block. Rex's "session" is a group of windows. GoRex's "tab" is Rex's
   "window", and the app's OS window is a client window.
