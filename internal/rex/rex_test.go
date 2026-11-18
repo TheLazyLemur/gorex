@@ -402,6 +402,7 @@ func TestClients(t *testing.T) {
 		{"too long", c1.Call("client.set_label", map[string]any{"label": strings.Repeat("é", 33)}, nil), "64 bytes"},
 		{"control", c1.Call("client.set_label", map[string]any{"label": "a\x01b"}, nil), "control"},
 		{"not UTF-8", raw("{\"label\":\"a\xffb\"}"), "UTF-8"},
+		{"lone surrogate", raw(`{"label":"a\ud800b"}`), "UTF-8"},
 		{"no label", c1.Call("client.set_label", map[string]any{}, nil), "required"},
 		{"client_id", c1.Call("client.set_label", map[string]any{"label": "x", "client_id": all.Clients[1].ID}, nil), "client_id"},
 	}

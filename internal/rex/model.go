@@ -91,8 +91,8 @@ func (s *Server) call(c *ctrl, method string, params json.RawMessage) (any, erro
 		var p struct {
 			Label *string `json:"label"`
 		}
-		// The JSON decoder swaps bytes that are not UTF-8 for U+FFFD, so
-		// the check is of the request itself.
+		// The JSON decoder swaps bytes that are not UTF-8, and a lone
+		// surrogate escape, for U+FFFD, so the check is of the request itself.
 		if !utf8.Valid(params) {
 			return nil, apiErr(CodeBadRequest, "a label must be valid UTF-8")
 		}
@@ -101,6 +101,12 @@ func (s *Server) call(c *ctrl, method string, params json.RawMessage) (any, erro
 		}
 		if p.Label == nil {
 			return nil, apiErr(CodeBadRequest, "label is required")
+		}
+		// A U+FFFD the request did not spell, as bytes or as \ufffd, is the
+		// decoder's swap for a lone surrogate escape.
+		spelled := bytes.Count(params, []byte("\uFFFD")) + bytes.Count(bytes.ToLower(params), []byte(`\ufffd`))
+		if strings.Count(*p.Label, "\uFFFD") > spelled {
+			return nil, apiErr(CodeBadRequest, "a label must be valid UTF-8")
 		}
 		label := strings.TrimSpace(*p.Label)
 		switch {
