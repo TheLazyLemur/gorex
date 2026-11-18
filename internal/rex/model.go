@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // rsession is a session of the server: its view, and per window the
@@ -27,8 +28,13 @@ type rsession struct {
 // ctrl is a control connection: its lines go out in order through out,
 // and it hears the events of the sessions it attached to.
 type ctrl struct {
-	conn     net.Conn
-	out      chan []byte
+	conn net.Conn
+	out  chan []byte
+	// id never changes, and seq is the order the connections opened in.
+	// label and sessions are the server's to change, under its lock.
+	id       string
+	seq      int
+	label    string
 	sessions map[string]bool
 }
 
@@ -74,11 +80,70 @@ func (s *Server) call(c *ctrl, method string, params json.RawMessage) (any, erro
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if _, err := s.rsession(p.SessionID); err != nil {
+		rs, err := s.rsession(p.SessionID)
+		if err != nil {
 			return nil, err
 		}
 		c.sessions[p.SessionID] = true
+		return map[string]any{"client_id": c.id, "view": viewOf(rs)}, nil
+
+	case "client.set_label":
+		var p struct {
+			Label *string `json:"label"`
+		}
+		// The JSON decoder swaps bytes that are not UTF-8 for U+FFFD, so
+		// the check is of the request itself.
+		if !utf8.Valid(params) {
+			return nil, apiErr(CodeBadRequest, "a label must be valid UTF-8")
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		if p.Label == nil {
+			return nil, apiErr(CodeBadRequest, "label is required")
+		}
+		label := strings.TrimSpace(*p.Label)
+		switch {
+		case len(label) > 64:
+			return nil, apiErr(CodeBadRequest, "a client's label has at most 64 bytes")
+		case strings.IndexFunc(label, unicode.IsControl) >= 0:
+			return nil, apiErr(CodeBadRequest, "a client's label has no control characters")
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		c.label = label
 		return nil, nil
+
+	case "client.list":
+		var p struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if p.SessionID != "" {
+			if _, err := s.rsession(p.SessionID); err != nil {
+				return nil, err
+			}
+		}
+		all := make([]*ctrl, 0, len(s.ctrls))
+		for c := range s.ctrls {
+			if p.SessionID == "" || c.sessions[p.SessionID] {
+				all = append(all, c)
+			}
+		}
+		slices.SortFunc(all, func(a, b *ctrl) int { return a.seq - b.seq })
+		type item struct {
+			ID    string `json:"client_id"`
+			Label string `json:"label"`
+		}
+		out := make([]item, len(all))
+		for i, c := range all {
+			out[i] = item{c.id, c.label}
+		}
+		return map[string]any{"clients": out}, nil
 
 	case "session.view":
 		var p struct {

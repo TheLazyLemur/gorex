@@ -36,6 +36,8 @@ type Server struct {
 	exe      string
 	exeTime  time.Time
 	controls int
+	// ctrlSeq counts the control connections opened, to order them.
+	ctrlSeq  int
 	idleFrom time.Time
 	quit     chan struct{}
 	quitOnce sync.Once
@@ -168,8 +170,10 @@ func (s *Server) handle(conn net.Conn) {
 // control serves a control connection: a request per line, answered in
 // order with the events of the sessions it attached to.
 func (s *Server) control(conn net.Conn, r *bufio.Reader, first []byte) {
-	c := &ctrl{conn: conn, out: make(chan []byte, 4096), sessions: map[string]bool{}}
+	c := &ctrl{conn: conn, out: make(chan []byte, 4096), id: newID("client"), sessions: map[string]bool{}}
 	s.mu.Lock()
+	s.ctrlSeq++
+	c.seq = s.ctrlSeq
 	s.controls++
 	s.ctrls[c] = struct{}{}
 	s.mu.Unlock()
@@ -211,7 +215,7 @@ func (s *Server) control(conn net.Conn, r *bufio.Reader, first []byte) {
 }
 
 // readOnly are the methods that change nothing to save.
-var readOnly = map[string]bool{"session.list": true, "session.view": true, "session.attach": true}
+var readOnly = map[string]bool{"session.list": true, "session.view": true, "session.attach": true, "client.list": true, "client.set_label": true}
 
 func (s *Server) request(c *ctrl, req Request) Response {
 	var data any
