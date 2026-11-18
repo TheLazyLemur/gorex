@@ -375,7 +375,8 @@ func TestRelabel(t *testing.T) {
 		t.Errorf("a missing label restored %q, not %q", listed(), chosen)
 	}
 
-	// A block's label is the default made from its ID until set.
+	// A new block has no label until one is set; clearing it restores the
+	// default made from its ID.
 	var w struct {
 		BlockIDs []string `json:"block_ids"`
 	}
@@ -388,12 +389,12 @@ func TestRelabel(t *testing.T) {
 		l := view().Windows[0].Layout.Split
 		return l.Before.Block.Label, l.After.Block.Label
 	}
-	if a, b := labels(); a != DefaultBlockLabel(first) || b != DefaultBlockLabel(second) || !strings.HasPrefix(a, "Block ") {
+	if a, b := labels(); a != "" || b != "" {
 		t.Fatalf("new blocks' labels %q %q", a, b)
 	}
 	sent()
 	call("session.set_block_label", map[string]any{"block_id": first, "label": " build "})
-	if a, b := labels(); a != "build" || b != DefaultBlockLabel(second) {
+	if a, b := labels(); a != "build" || b != "" {
 		t.Fatalf("labels %q %q", a, b)
 	}
 	if got := sent(); !slices.Equal(got, []string{"session_view_changed"}) {
@@ -401,7 +402,7 @@ func TestRelabel(t *testing.T) {
 	}
 	call("session.set_block_label", map[string]any{"block_id": second, "label": "logs"})
 	call("session.set_block_label", map[string]any{"block_id": second})
-	if _, b := labels(); b != DefaultBlockLabel(second) {
+	if _, b := labels(); b != DefaultBlockLabel(second) || !strings.HasPrefix(b, "Block ") {
 		t.Errorf("a missing label restored %q", b)
 	}
 
@@ -447,5 +448,29 @@ func TestRelabel(t *testing.T) {
 	call("session.set_label", map[string]any{})
 	if listed() != chosen {
 		t.Errorf("after a restart an empty label restored %q, not %q", listed(), chosen)
+	}
+}
+
+func TestNewSessionLabel(t *testing.T) {
+	// given
+	// ... a session called "mine" that holds a chosen label
+	s := &Server{rsessions: []*rsession{{view: SessionView{Label: "mine"}, chosen: "quiet-meadow"}}}
+
+	// when
+	// ... more labels are picked than there are adjective-noun pairs
+	seen := map[string]bool{"quiet-meadow": true}
+	for range 150 {
+		l := s.newSessionLabel()
+		if seen[l] {
+			t.Fatalf("%q was picked twice", l)
+		}
+		seen[l] = true
+		s.rsessions = append(s.rsessions, &rsession{view: SessionView{Label: l}, chosen: l})
+	}
+
+	// then
+	// ... none repeats, and none loops forever
+	if len(seen) != 151 {
+		t.Errorf("%d distinct labels", len(seen))
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -356,8 +357,8 @@ func (s *Server) call(c *ctrl, method string, params json.RawMessage) (any, erro
 		if b == nil {
 			return nil, apiErr(CodeNotFound, "block %s is not in the session", p.BlockID)
 		}
-		if label == DefaultBlockLabel(b.ID) {
-			label = ""
+		if label == "" {
+			label = DefaultBlockLabel(b.ID)
 		}
 		if b.Label != label {
 			b.Label = label
@@ -845,20 +846,8 @@ func viewOf(rs *rsession) SessionView {
 	b, _ := json.Marshal(rs.view)
 	var v SessionView
 	json.Unmarshal(b, &v)
-	var fill func(n *LayoutNode)
-	fill = func(n *LayoutNode) {
-		if n.Block != nil {
-			if n.Block.Label == "" {
-				n.Block.Label = DefaultBlockLabel(n.Block.ID)
-			}
-			return
-		}
-		fill(n.Split.Before)
-		fill(n.Split.After)
-	}
 	for _, w := range v.Windows {
 		w.Label = labelOf(w)
-		fill(w.Layout)
 	}
 	return v
 }
@@ -925,16 +914,17 @@ func cmp(v, def float64) float64 {
 	return v
 }
 
-// newSessionLabel picks a label no session has, as Rex's quiet-meadow.
+// newSessionLabel picks a label no session has, nor has chosen, as Rex's
+// quiet-meadow. Once every pair is taken it adds a number.
 func (s *Server) newSessionLabel() string {
 	adj := []string{"quiet", "bright", "calm", "swift", "amber", "misty", "golden", "silver", "gentle", "bold"}
 	noun := []string{"meadow", "river", "harbor", "forest", "canyon", "summit", "valley", "island", "garden", "comet"}
-	for {
-		l := adj[mrand.IntN(len(adj))] + "-" + noun[mrand.IntN(len(noun))]
-		if !slices.ContainsFunc(s.rsessions, func(rs *rsession) bool { return rs.view.Label == l }) {
-			return l
-		}
+	base := adj[mrand.IntN(len(adj))] + "-" + noun[mrand.IntN(len(noun))]
+	l := base
+	for n := 2; slices.ContainsFunc(s.rsessions, func(rs *rsession) bool { return rs.view.Label == l || rs.chosen == l }); n++ {
+		l = base + "-" + strconv.Itoa(n)
 	}
+	return l
 }
 
 // savedState is what the server keeps on disk, to start its sessions
@@ -1018,7 +1008,7 @@ func (s *Server) load() {
 	for _, ss := range st.Sessions {
 		rs := &rsession{view: ss.View, chosen: ss.Chosen, recent: ss.Recent}
 		if rs.chosen == "" { // saved before the server kept it
-			rs.chosen = s.newSessionLabel()
+			rs.chosen = rs.view.Label
 		}
 		if rs.recent == nil {
 			rs.recent = map[string][]string{}
