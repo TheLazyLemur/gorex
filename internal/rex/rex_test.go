@@ -291,6 +291,149 @@ func TestSessions(t *testing.T) {
 	}
 }
 
+// TestClients checks clients' IDs and labels: attaching names the client,
+// labels follow the rules, and the list shows the connected clients in
+// the order they connected, by session when asked.
+func TestClients(t *testing.T) {
+	// given
+	// ... a server with a session, and two clients, one attached to it
+	c1, _ := serve(t, testDir(t))
+	c2, err := Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Shutdown() // c1 closes in the test
+	var sess struct {
+		ID string `json:"session_id"`
+	}
+	if err := c1.Call("session.create", map[string]any{}, &sess); err != nil {
+		t.Fatal(err)
+	}
+	type attached struct {
+		ClientID string      `json:"client_id"`
+		View     SessionView `json:"view"`
+	}
+	attach := func() attached {
+		t.Helper()
+		var a attached
+		if err := c1.Call("session.attach", map[string]any{"session_id": sess.ID}, &a); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	type listed struct {
+		Clients []struct {
+			ID    string `json:"client_id"`
+			Label string `json:"label"`
+		} `json:"clients"`
+	}
+	list := func(params map[string]any) listed {
+		t.Helper()
+		var l listed
+		if err := c2.Call("client.list", params, &l); err != nil {
+			t.Fatal(err)
+		}
+		return l
+	}
+
+	// when
+	// ... the first client attaches twice, and the other lists every client
+	first := attach()
+	if err := c1.Call("session.new_window", map[string]any{"session_id": sess.ID, "layout": shellBlock()}, nil); err != nil {
+		t.Fatal(err)
+	}
+	again := attach()
+	all := list(map[string]any{})
+
+	// then
+	// ... both attaches name the same client, the second with the newer view, and the list has both in the order they connected
+	if !strings.HasPrefix(first.ClientID, "client:") || again.ClientID != first.ClientID {
+		t.Errorf("client IDs %q, %q", first.ClientID, again.ClientID)
+	}
+	if first.View.ID != sess.ID || again.View.Revision <= first.View.Revision || len(again.View.Windows) != 1 {
+		t.Errorf("views %+v, %+v", first.View, again.View)
+	}
+	if len(all.Clients) != 2 || all.Clients[0].ID != first.ClientID || all.Clients[1].ID == first.ClientID {
+		t.Fatalf("list %+v", all)
+	}
+
+	// when
+	// ... the clients take the same label, one padded
+	if err := c1.Call("client.set_label", map[string]any{"label": "  studio \t"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Call("client.set_label", map[string]any{"label": "studio"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	all = list(map[string]any{})
+	only := list(map[string]any{"session_id": sess.ID})
+
+	// then
+	// ... the labels are trimmed and shared, the IDs tell the clients apart, and the session's list has the attached one
+	if all.Clients[0].Label != "studio" || all.Clients[1].Label != "studio" || all.Clients[0].ID == all.Clients[1].ID {
+		t.Errorf("list %+v", all)
+	}
+	if len(only.Clients) != 1 || only.Clients[0].ID != first.ClientID {
+		t.Errorf("list of the session %+v", only)
+	}
+
+	// when
+	// ... a label is emptied
+	if err := c1.Call("client.set_label", map[string]any{"label": "   "}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// then
+	// ... the label is gone
+	if got := list(map[string]any{}).Clients[0].Label; got != "" {
+		t.Errorf("label %q", got)
+	}
+
+	// when
+	// ... labels that break a rule are set, and a client_id sent
+	raw := func(label string) error {
+		return c1.call(Request{Method: "client.set_label", Params: json.RawMessage(label)}, nil)
+	}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"too long", c1.Call("client.set_label", map[string]any{"label": strings.Repeat("é", 33)}, nil), "64 bytes"},
+		{"control", c1.Call("client.set_label", map[string]any{"label": "a\x01b"}, nil), "control"},
+		{"not UTF-8", raw("{\"label\":\"a\xffb\"}"), "UTF-8"},
+		{"lone surrogate", raw(`{"label":"a\ud800b"}`), "UTF-8"},
+		{"no label", c1.Call("client.set_label", map[string]any{}, nil), "required"},
+		{"client_id", c1.Call("client.set_label", map[string]any{"label": "x", "client_id": all.Clients[1].ID}, nil), "client_id"},
+	}
+
+	// then
+	// ... each fails with bad_request, naming the rule, and the label stays unset
+	for _, tc := range cases {
+		var ae *APIError
+		if !errors.As(tc.err, &ae) || ae.Code != CodeBadRequest || !strings.Contains(ae.Msg, tc.want) {
+			t.Errorf("%s: %v", tc.name, tc.err)
+		}
+	}
+	if got := list(map[string]any{}).Clients[0].Label; got != "" {
+		t.Errorf("label %q after bad ones", got)
+	}
+
+	// when
+	// ... the first client's connection closes
+	c1.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(list(map[string]any{}).Clients) != 1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// then
+	// ... it leaves the list
+	if l := list(map[string]any{}); len(l.Clients) != 1 || l.Clients[0].ID == first.ClientID {
+		t.Errorf("list %+v", l)
+	}
+}
+
 // TestRelabel sets and restores the labels of a session and of a block,
 // through Rex's methods, and checks that they and the label the server
 // chose outlive a restart.
