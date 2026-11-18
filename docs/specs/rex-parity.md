@@ -52,34 +52,34 @@ deliberate piece of work.
 
 The work is done in phases. Each phase depends on the one before it.
 
-| Phase | Delivers |
-| --- | --- |
-| 0 | A parity checklist derived from the reference pages, and a parity test that enforces the action table |
-| 1 | The server owns the model: sessions, windows, blocks, clients; Rex's methods and events; the app becomes a client |
-| 2 | The `rex` CLI |
-| 3 | Rex's action names and default shortcuts; `init.lua` with bindings, sequences, modes and custom actions; `rex do` scripts and Lua events |
-| 4 | The rest of the Mac client: multiple sessions and windows, sidebar and Activity, floating panes, remaining pane and tab actions, find, prompts, Go to Anything, Quick Look |
-| 5 | Agents: OSC 7501, `rex skill`, the Coding Agents and Program Activity settings |
-| 6 | Remote: listeners, hosts, Tailscale, `rex server install` over SSH, Linux and FreeBSD servers |
-| 7 | Look and settings: themes, imports, typography, cursor, padding, toolbar layouts, onboarding |
+| Phase | Delivers | Status |
+| --- | --- | --- |
+| 0 | A parity checklist derived from the reference pages, and a parity test that enforces the action table | Not started |
+| 1 | The server owns the model: sessions, windows, blocks, clients; Rex's methods and events; the app becomes a client | In progress: model and vocabulary done |
+| 2 | The `rex` CLI | Not started |
+| 3 | Rex's action names and default shortcuts; `init.lua` with bindings, sequences, modes and custom actions; `rex do` scripts and Lua events | Not started |
+| 4 | The rest of the Mac client: multiple sessions and windows, sidebar and Activity, floating panes, remaining pane and tab actions, find, prompts, Go to Anything, Quick Look | Not started |
+| 5 | Agents: OSC 7501, `rex skill`, the Coding Agents and Program Activity settings | Not started |
+| 6 | Remote: listeners, hosts, Tailscale, `rex server install` over SSH, Linux and FreeBSD servers | Not started |
+| 7 | Look and settings: themes, imports, typography, cursor, padding, toolbar layouts, onboarding | Not started |
 
 ## User Stories
 
 ### Model and vocabulary (phase 1)
 
-1. As a Rex user, I want GoRex to use Rex's terms (session, window, block, client, layer), so that Rex's docs describe GoRex.
-2. As a user, I want a session to be a group of related work that keeps running whether or not any app is looking at it, so that I can close the app and come back.
-3. As a user, I want a window to be a tab within a session holding a layout of blocks, so that tabs behave as in Rex.
-4. As a user, I want every session, window, block and client to have an ID that never changes and is never reused (`session:<uuid>`, `window:<uuid>`, `block:<uuid>`, `client:<uuid>`), so that scripts can hold on to them.
-5. As a user, I want to give sessions, windows, blocks and clients labels I can change, so that I can refer to them by name.
-6. As a user, I want the layout to live on the server, so that two apps attached to the same session see the same windows and splits.
-7. As a user, I want the server to tell every attached client when the layout changes (`session_view_changed` with a `revision`), so that all clients stay in step.
-8. As a user upgrading GoRex, I accept a one-time reset: the first server of the new model deletes the old saved layout (`layout.json`) once and starts with a fresh session, so that the new server never has to read the old format.
+1. As a Rex user, I want GoRex to use Rex's terms (session, window, block, client, layer), so that Rex's docs describe GoRex. **Done.**
+2. As a user, I want a session to be a group of related work that keeps running whether or not any app is looking at it, so that I can close the app and come back. **Done.**
+3. As a user, I want a window to be a tab within a session holding a layout of blocks, so that tabs behave as in Rex. **Done.**
+4. As a user, I want every session, window, block and client to have an ID that never changes and is never reused (`session:<uuid>`, `window:<uuid>`, `block:<uuid>`, `client:<uuid>`), so that scripts can hold on to them. **Done.**
+5. As a user, I want to give sessions, windows, blocks and clients labels I can change, so that I can refer to them by name. **Done.**
+6. As a user, I want the layout to live on the server, so that two apps attached to the same session see the same windows and splits. **Done.**
+7. As a user, I want the server to tell every attached client when the layout changes (`session_view_changed` with a `revision`), so that all clients stay in step. **Done.**
+8. As a user upgrading GoRex, I accept a one-time reset: the first server of the new model deletes the old saved layout (`layout.json`) once and starts with a fresh session, so that the new server never has to read the old format. **Done.**
 
 ### Server API (phase 1)
 
-9. As a script author, I want the server to implement Rex's `session.*` methods (`create`, `list`, `view`, `new_window`, `new_split`, `new_block`, `close_window`, `focus_block`, `focus_direction`, `focus_next_pane`, `focus_previous_pane`, `focus_window`, `focus_next_window`, `focus_previous_window`, `move_block`, `move_window`, `move`, `swap_blocks`, `zoom_block`, `resize_pane`, `set_label`, `set_window_label`, `set_block_label`, `destroy`, `attach`, `attach_all`, `bootstrap`, `detach`, `detach_block`, `list_blocks`, `list_clients`, `describe_block`, `help`), so that calls written for Rex work against GoRex.
-10. As a script author, I want `block.close`, `block.event` and `block.method` with Rex's rules (exactly one of `block_id` or `window_id`, `keep_last`, events limited to `key`, `paste`, `mouse`, `wheel`, `focus`), so that block control behaves the same.
+9. As a script author, I want the server to implement Rex's `session.*` methods (`create`, `list`, `view`, `new_window`, `new_split`, `new_block`, `close_window`, `focus_block`, `focus_direction`, `focus_next_pane`, `focus_previous_pane`, `focus_window`, `focus_next_window`, `focus_previous_window`, `move_block`, `move_window`, `move`, `swap_blocks`, `zoom_block`, `resize_pane`, `set_label`, `set_window_label`, `set_block_label`, `destroy`, `attach`, `attach_all`, `bootstrap`, `detach`, `detach_block`, `list_blocks`, `list_clients`, `describe_block`, `help`), so that calls written for Rex work against GoRex. Done so far: `create`, `list`, `view`, `new_window`, `new_split`, `close_window`, `focus_block`, `focus_window`, `move_window`, `zoom_block`, `resize_pane`, `set_label`, `set_window_label`, `set_block_label`, `attach`.
+10. As a script author, I want `block.close`, `block.event` and `block.method` with Rex's rules (exactly one of `block_id` or `window_id`, `keep_last`, events limited to `key`, `paste`, `mouse`, `wheel`, `focus`), so that block control behaves the same. Done so far: `block.close`.
 11. As a script author, I want terminal blocks to offer Rex's block methods (`com.superlogical.terminal.format`, `.pwd`, `.title`, and the rest of the terminal creator's methods), so that I can read a terminal's screen.
 12. As a script author, I want `client.*` methods (`list`, `inspect`, `action`, `perform`, `key`, `keymap`, `reply`, `set_label`, `set_script`), so that I can drive a connected app.
 13. As a script author, I want `server.version`, `server.status`, `server.stop`, `server.whoami` and `server.config_reload`, so that I can manage the server.
