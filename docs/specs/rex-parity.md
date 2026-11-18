@@ -228,12 +228,20 @@ The work is done in phases. Each phase depends on the one before it.
   | `⌘K` clears the screen | `⌘K` is Change Session (`session.switch`) |
   | `⇧⌘W` closes the tab | `⇧⌘W` closes the window; Close Tab is `⌥⌘W` |
   | `⇧⌘]` / `⇧⌘[` change tab | `⌃Tab` / `⌃⇧Tab` change tab; `⌘]` / `⌘[` focus the next/previous pane |
-  | `⌘=` increases the font size | `⇧⌘=` |
   | `⇧⌘R` renames the tab | Rename Tab has no default; `⌘R` is Refresh Sessions |
   | `⌃⌘`+arrows move a divider | Resize Pane has no default (Rex resizes through a key mode); `⌥⇧⌘`+arrows move the pane |
   | `⌃⌘=` equalises panes | Balance Splits has no default |
   | `⌘P` opens the palette at panes | `⌘P` is Go to Anything |
 
+- **Font size is per block, unlike Rex.** Rex's `client.font.increase`,
+  `client.font.decrease` and `client.font.reset` change the size for the whole
+  client. In GoRex they keep their names and shortcuts but act on the focused
+  block only, as Ghostty's do on a split. The size is a property of the block
+  on the server, so it survives a restart, every attached client sees it, and
+  scripts can set it through `block.set_font_size` (a GoRex extra). A block
+  split from another takes that block's size; a new window's first block
+  starts at the Terminal Font Size setting, and reset returns the focused block
+  to it. The parity test lists the three actions as deliberately different.
 - **OSC 7501 follows revision 0.4** of the Program Status Protocol. Terminal
   parsing feeds `program_status_changed` and `program_status_removed`, and the
   UI reads records from the server like any other client.
@@ -280,6 +288,8 @@ The work is done in phases. Each phase depends on the one before it.
   parity tables are transcribed and cite the source pages.
 - **GoRex's own extras.** Quit and End All Sessions (`⌥⌘Q`) and Clear Screen
   and Scrollback have no Rex action. Keep them under new names, or drop them?
+  `block.set_font_size` is decided (see Implementation Decisions); its CLI
+  command name isn't.
 - **Upgrade path.** Migrate the current saved layout and running sessions into
   the new model, or accept a one-time reset? A migration needs the old format
   to be readable by the new server.
